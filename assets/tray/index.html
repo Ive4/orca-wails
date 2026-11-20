@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orca 任务</title>
+  <link rel="stylesheet" href="panel.css">
+  <script defer src="panel.js"></script>
+</head>
+<body>
+<main id="panel" class="popup" aria-label="Orca 任务">
+  <section id="tasks" class="page">
+    <nav class="tabs" aria-label="任务列表">
+      <button class="tab" id="active" aria-current="true">进行中<span id="count"></span></button>
+      <button class="tab" id="recent" aria-current="false">最近结束</button>
+    </nav>
+    <div class="list" id="list" aria-label="任务状态">
+      <div class="empty">正在读取任务…</div>
+    </div>
+    <div class="notice" id="task-message" role="status" hidden></div>
+    <footer class="foot">
+      <button class="control" id="settings-button">
+        <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>设置
+      </button>
+      <button class="control open" id="open">
+        打开 Orca <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 16l8-8m-6 0h6v6"/></svg>
+      </button>
+    </footer>
+  </section>
+  <section id="preferences" class="page" hidden>
+    <header class="settings-head">
+      <button class="control" id="back" aria-label="返回">
+        <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+      </button>
+      <h2 id="page-title">设置</h2>
+    </header>
+    <div class="settings-body" id="settings-content"></div>
+    <div class="notice" id="settings-message" role="status" hidden></div>
+  </section>
+</main>
+</body>
+</html>

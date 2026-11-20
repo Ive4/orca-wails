@@ -1,0 +1,29 @@
+{
+  "version": "v1.4.266",
+  "package_revision": "0.0.4",
+  "target": "aarch64-apple-darwin",
+  "upstream_target": "darwin-arm64",
+  "upstream": {
+    "archive": "Orca-1.4.266-arm64-mac.zip",
+    "archive_sha256": "4c8604ef0967140de4dfcba34169dfe339c3fa59166f031a65aae6e3f70027d9",
+    "commit": "903c91e80fbe7bbcaffe6ac767c49eac91e98a64",
+    "app_build_commit": "3df243e7d5610fe956c7776144571c7d3640fadb",
+    "source_archive_sha256": "30f1b47cb8c88a36e844f11157a9fa4e7094089ca2a8db9cb0b6f616b9f14162",
+    "team_id": "6CX3WHS9HZ",
+    "template_sha256": "6de78a11f036cbe3746c603f4ce4edb742ff6c93e01bddd8a2a6b6f796bd2cce",
+    "web_inventory_sha256": "a74a32f8c89a2f7778b949829cf89099b0a54a9f4939e434c65c37d253b57b90",
+    "artifact_source_sha256": "af5a5cf2e4bb11c8c06eb4ba8bc2f0e78260c589446c7e646a4572c6933b9772",
+    "node_executable_sha256": "6f32069480ec14d52b6d7b1f3c7124cfbbc46203abf5ddf5c65b127435f3f329",
+    "license_sha256": "ff1b611f80580d49f4b97e93a97b24eb050b0671b26b8afe16341fab699112f3"
+  },
+  "bun": {
+    "version": "1.4.4",
+    "archive_sha256": "be5f17d636d699b2eaa2c1a8ac802c87f0815ccb5fe26cbe63d2395354ae5d0d",
+    "executable_sha256": "0a2237cdcfa0d16ef501d9acca9f0026309ef348bea7393a64e8d1e3609565cc",
+    "license_sha256": "362fe32c954ec829240bd7429c53d705eef08c6bfa45ffc2d02005f857cba4dd"
+  },
+  "sqlite": {
+    "version": "3.54.1",
+    "archive_sha3_256": "92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30"
+  }
+}

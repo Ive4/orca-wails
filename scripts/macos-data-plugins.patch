@@ -1,0 +1,2572 @@
+diff --git a/config/scripts/build-identity/build-source-commit.mjs b/config/scripts/build-identity/build-source-commit.mjs
+index 5f97b4ef..82fe937e 100644
+--- a/config/scripts/build-identity/build-source-commit.mjs
++++ b/config/scripts/build-identity/build-source-commit.mjs
+@@ -2,6 +2,10 @@ import { execFileSync } from 'node:child_process'
+ 
+ // Pin official skill installs to the full build commit so installed and bundled skills agree on every channel.
+ export function resolveBuildSourceCommit() {
++  const pinned = process.env.ORCA_TAURI_SOURCE_COMMIT
++  if (pinned && /^[a-f0-9]{40}$/.test(pinned)) {
++    return pinned
++  }
+   let commit = ''
+   try {
+     commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+diff --git a/config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs b/config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs
+index 241113be..f9041bc4 100644
+--- a/config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs
++++ b/config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs
+@@ -221,3 +221,19 @@ export function buildOrcadLauncher(outfile) {
+     logLevel: 'error'
+   })
+ }
++
++/** Built beside the server for its consented, separately supervised plugin workers. */
++export function buildOrcadPluginHost(outfile) {
++  return build({
++    ...ORCAD_COMMONJS_MODULE_OPTIONS,
++    entryPoints: [join(root, 'src/main/plugins/workers/plugin-host-entry.ts')],
++    bundle: true,
++    platform: 'node',
++    target: ORCAD_SERVER_BUILD_TARGET,
++    format: 'cjs',
++    outfile,
++    plugins: ORCAD_BUNDLE_PLUGINS,
++    minify: true,
++    logLevel: 'error'
++  })
++}
+diff --git a/src/main/backend/core-runtime-activation.ts b/src/main/backend/core-runtime-activation.ts
+index cb814107..feefb131 100644
+--- a/src/main/backend/core-runtime-activation.ts
++++ b/src/main/backend/core-runtime-activation.ts
+@@ -296,6 +296,16 @@ export async function activateBackendRuntime(
+   const connector = await installOrcadConnectorHost(runtime, profileStore, registerCleanup)
+ 
+   const bindHost = resolveOrcadBindHost(options.bind)
++  if (
++    bindHost === '127.0.0.1' &&
++    process.platform === 'darwin' &&
++    process.env.ORCA_TAURI_DATA_PLUGINS === '1'
++  ) {
++    const { startOrcadDataPlugins } = await import('../orcad/host-runtime/orcad-data-plugins')
++    registerCleanup(
++      await startOrcadDataPlugins(profileStore, runtimeUserDataPath, runtime, agentHookServer)
++    )
++  }
+   bindOrcadStopTerminalAdmission(runtime.terminalUpdateAdmission)
+   const rpc = createOrcadRuntimeRpcServer(runtime, runtimeUserDataPath, options, bindHost)
+   pairedEnvironments.bindRpc(rpc)
+diff --git a/src/main/orcad/browser-providers/orcad-browser-provider.ts b/src/main/orcad/browser-providers/orcad-browser-provider.ts
+index ef4cb2cb..d0e66afe 100644
+--- a/src/main/orcad/browser-providers/orcad-browser-provider.ts
++++ b/src/main/orcad/browser-providers/orcad-browser-provider.ts
+@@ -205,9 +205,11 @@ export async function resolveOrcadBrowserProvider(
+     return null
+   }
+ 
+-  const installedElectronExecutable = await (
+-    options.resolveInstalledElectronExecutable ?? resolveInstalledElectronExecutable
+-  )()
++  // Orca-Tauri keeps the official desktop app independent of its owned core.
++  const installedElectronExecutable =
++    environment.ORCA_TAURI_DISABLE_ELECTRON_BROWSER === '1'
++      ? null
++      : await (options.resolveInstalledElectronExecutable ?? resolveInstalledElectronExecutable)()
+   if (options.signal?.aborted) {
+     return null
+   }
+diff --git a/src/main/orcad/host-runtime/orcad-data-plugins.ts b/src/main/orcad/host-runtime/orcad-data-plugins.ts
+new file mode 100644
+index 00000000..ba67e900
+--- /dev/null
++++ b/src/main/orcad/host-runtime/orcad-data-plugins.ts
+@@ -0,0 +1,769 @@
++import { isPluginSourceModulePath } from '../../../shared/plugins/frames/plugin-frame-source-modules'
++import { isAbsolute, join } from 'node:path'
++import { version as desktopVersion } from '../../../../package.json'
++import {
++  normalizePluginConsents,
++  normalizePluginIdList
++} from '../../../shared/plugins/approval/plugin-consent-state'
++import { pluginCatalogReleaseCompatibilityError } from '../../../shared/plugins/manifest/plugin-manifest-compatibility'
++import { pluginHostVersion } from '../../../shared/plugins/installation/plugin-host-version'
++import type { PluginManifest } from '../../../shared/plugins/manifest/plugin-manifest'
++import {
++  DataPluginConsentParams,
++  DataPluginArtifactParams,
++  DataPluginInvokeParams,
++  DataPluginEditorParams,
++  DataPluginInstallSourceParams,
++  DataPluginResolveGitParams,
++  DataPluginPushCloseParams,
++  DataPluginPushParams,
++  DataPluginSettingParams,
++  DataPluginCatalogParams,
++  DataPluginEnablementParams,
++  DataPluginInstallParams,
++  DataPluginKeyParams,
++  DataPluginNewFileParams,
++  DataPluginPreviewParams,
++  DataPluginSystemParams
++} from '../../../shared/rpc-contract/plugins/data-plugin-params'
++import type { Store } from '../../persistence/loading-store/store'
++import {
++  applyPluginConsent,
++  applyPluginEnablement,
++  revokePluginConsent
++} from '../../plugins/activation/plugin-enablement'
++import { PluginKillListService } from '../../plugins/catalog/plugin-kill-list-service'
++import { PluginMarketplaceInstaller } from '../../plugins/catalog/plugin-marketplace-installer'
++import {
++  PluginMarketplaceService,
++  type PluginMarketplaceListing
++} from '../../plugins/catalog/plugin-marketplace-service'
++import { refreshInstalledPluginCatalog } from '../../plugins/catalog/plugin-marketplace-shared-refresh'
++import {
++  installCatalogReleaseWithApproval,
++  readPreviewAccessGrowth
++} from '../../plugins/catalog/plugin-update-approval'
++import { readApprovedPluginNewFileTemplate } from '../../plugins/contributions/plugin-new-file-template'
++import { listPluginsForClients } from '../../plugins/discovery/plugin-client-list'
++import { getPluginsDataDir, getUserPluginsDir } from '../../plugins/discovery/plugin-discovery'
++import {
++  installPluginFromGit,
++  installPluginFromLocalPath
++} from '../../plugins/installation/plugin-install'
++import { resolvePluginGitSource } from '../../plugins/installation/plugin-git-ref-resolution'
++import { uninstallInstalledPlugin } from '../../plugins/installation/plugin-uninstall'
++import { PluginService } from '../../plugins/plugin-service'
++import {
++  readPluginDeclaredSettings,
++  writePluginDeclaredSetting
++} from '../../plugins/storage/plugin-declared-settings'
++import { emitWorktreeLifecycleForPlugins } from '../../plugins/events/plugin-worktree-lifecycle'
++import { defineMethod, defineStreamingMethod, type RpcContext } from '../../runtime/rpc/core'
++import type { OrcaRuntimeService } from '../../runtime/orca-runtime'
++import {
++  bindPluginRuntime,
++  createPluginAgentStatusForwarder,
++  watchPluginWorkspaceContext
++} from '../../plugins/runtime/plugin-runtime-binding'
++import { projectPluginAgentStatusChangedPayload } from '../../plugins/events/plugin-agent-status-event'
++import type { agentHookServer } from '../../agent-hooks/server/agent-hook-server'
++import {
++  PluginReadPanelEntryParams,
++  PluginsPanelActionParams
++} from '../../../shared/rpc-contract/plugins/plugins-params'
++
++const capabilities = [
++  'app-theme',
++  'terminal-theme',
++  'icon-theme',
++  'syntax',
++  'interface-language',
++  'new-file',
++  'worker',
++  'script-panel',
++  'custom-editor'
++] as const
++
++export function pluginManifestUnavailableReason(manifest: PluginManifest): string | null {
++  if (
++    manifest.contributes.panels.some((panel) => panel.ui === 'components') ||
++    manifest.contributes.customEditors.some((editor) => editor.frame === 'isolated')
++  ) {
++    return 'This plugin requires an isolated desktop guest.'
++  }
++  if (
++    [...manifest.contributes.panels, ...manifest.contributes.customEditors].some(({ entry }) =>
++      isPluginSourceModulePath(entry)
++    )
++  ) {
++    return 'Plugin frame source modules require the desktop resource protocol.'
++  }
++  if (manifest.contributes.fonts.length > 0) {
++    return 'Plugin fonts require the desktop resource protocol.'
++  }
++  if (manifest.contributes.vmRecipes.length > 0 || manifest.contributes.statusBarItems.length > 0) {
++    return 'This plugin requires desktop VM recipe or status bar services.'
++  }
++  return null
++}
++
++function unavailableReason(listing: PluginMarketplaceListing, hostVersion: string): string | null {
++  if (listing.blockedByKillList) {
++    return listing.blockedByKillList.reason
++  }
++  if (!listing.official || !listing.release) {
++    return 'Requires an official catalog release with a pinned commit and content hash.'
++  }
++  if (listing.release.contributes?.some(({ kind }) => kind === 'fonts')) {
++    return 'Plugin fonts require the desktop resource protocol.'
++  }
++  return pluginCatalogReleaseCompatibilityError(listing.release, hostVersion)
++}
++
++type DataHost = {
++  store: Store
++  service: PluginService
++  catalog: PluginMarketplaceService
++  installer: PluginMarketplaceInstaller
++  hostVersion: string
++  revision: number
++  disposed: boolean
++  writes: Promise<unknown>
++}
++
++let active: DataHost | null = null
++
++export async function startOrcadDataPlugins(
++  store: Store,
++  userDataPath: string,
++  runtime: OrcaRuntimeService,
++  hooks: typeof agentHookServer
++): Promise<() => Promise<void>> {
++  const hostVersion = pluginHostVersion(process.env.ORCA_TAURI_PLUGIN_VERSION ?? desktopVersion)
++  const pluginsDataDir = getPluginsDataDir(userDataPath)
++  const killList = new PluginKillListService({ pluginsDataDir })
++  await killList.initialize()
++  const service = new PluginService({
++    userDataPath,
++    hostVersion,
++    isPluginSystemEnabled: () => store.getSettings().pluginSystemEnabled === true,
++    getDisabledPlugins: () => normalizePluginIdList(store.getSettings().disabledPlugins),
++    getPluginConsents: () => normalizePluginConsents(store.getSettings().pluginConsents),
++    getDevPluginPaths: () => [],
++    headless: true,
++    hostEntryPath: join(__dirname, 'plugin-host-entry.js'),
++    admitManifest: (manifest) => pluginManifestUnavailableReason(manifest) === null,
++    getPluginKillListEntry: (key) => killList.find(key)
++  })
++  const catalog = new PluginMarketplaceService({
++    pluginsDataDir,
++    hostVersion,
++    getKillListEntry: (key) => killList.find(key)
++  })
++  const installer = new PluginMarketplaceInstaller({
++    marketplace: catalog,
++    userDataPath,
++    hostVersion,
++    blockedPluginReason: (key) => killList.reason(key),
++    revokeConsent: (pluginKey) => revokePluginConsent({ store, pluginService: service, pluginKey })
++  })
++  const { ALL_RPC_METHODS } = await import('../../runtime/rpc/methods/rpc-method-registry')
++  const delegate = bindPluginRuntime(service, runtime, hooks, ALL_RPC_METHODS)
++  const forwardAgentStatus = createPluginAgentStatusForwarder(delegate, service)
++  const stopAgentEvents = hooks.subscribeEnrichedStatus((event) => {
++    const payload = projectPluginAgentStatusChangedPayload(event, store)
++    if (payload) {
++      forwardAgentStatus(payload, event.terminalHandle)
++    }
++  })
++  const stopWorkspaceEvents = watchPluginWorkspaceContext({
++    delegate,
++    events: service,
++    onSessionWritten: (listener) => store.onWorkspaceSessionWritten(listener),
++    onStateWritten: (listener) => store.onStateWritten(listener)
++  })
++  const stopWorktreeEvents = runtime.onWorktreeLifecycle((event) =>
++    emitWorktreeLifecycleForPlugins(service, event)
++  )
++  try {
++    await service.initialize()
++  } catch (error) {
++    stopAgentEvents()
++    stopWorkspaceEvents()
++    stopWorktreeEvents()
++    killList.dispose()
++    await service.dispose()
++    throw error
++  }
++  const state: DataHost = {
++    store,
++    service,
++    catalog,
++    installer,
++    hostVersion,
++    revision: 0,
++    disposed: false,
++    writes: Promise.resolve()
++  }
++  active = state
++  const stopChanges = service.onChanged(({ contentPacksChanged }) => {
++    if (contentPacksChanged) {
++      state.revision++
++    }
++  })
++  const refreshSafetyList = () =>
++    void killList.refresh().catch(() => {
++      console.warn('[plugins] could not refresh safety list; using cached state')
++    })
++  const stopKillList = killList.onChanged(() => {
++    void service.reconcileActivationState().catch(() => {
++      console.warn('[plugins] could not reconcile the safety list')
++    })
++  })
++  const stopSettings = store.onSettingsChanged((updates) => {
++    if (updates.pluginSystemEnabled !== undefined) {
++      killList.syncPeriodicRefresh(updates.pluginSystemEnabled)
++      if (updates.pluginSystemEnabled) {
++        refreshSafetyList()
++      }
++      void service
++        .refresh()
++        .catch(() => console.warn('[plugins] could not refresh installed data plugins'))
++    }
++  })
++  if (service.options.isPluginSystemEnabled()) {
++    killList.syncPeriodicRefresh(true)
++    refreshSafetyList()
++  }
++  return async () => {
++    active = null
++    state.disposed = true
++    stopAgentEvents()
++    stopWorkspaceEvents()
++    stopWorktreeEvents()
++    stopSettings()
++    stopChanges()
++    stopKillList()
++    killList.dispose()
++    await state.writes.catch(() => undefined)
++    await service.dispose()
++  }
++}
++
++async function host(requireEnabled = true): Promise<DataHost> {
++  const state = active
++  if (!state) {
++    throw new Error('Data plugins are unavailable on this host.')
++  }
++  await state.service.whenReady()
++  if (requireEnabled && !state.service.options.isPluginSystemEnabled()) {
++    throw new Error('The plugin system is disabled.')
++  }
++  return state
++}
++
++async function mutate<T>(operation: (state: DataHost) => Promise<T>): Promise<T> {
++  const state = await host(false)
++  const write = state.writes
++    .catch(() => undefined)
++    .then(() => {
++      if (state.disposed) {
++        throw new Error('The data plugin host is stopping.')
++      }
++      return operation(state)
++    })
++  state.writes = write
++  return write
++}
++
++async function catalogRelease(state: DataHost, sourceId: string, pluginKey: string) {
++  if (!state.service.options.isPluginSystemEnabled()) {
++    throw new Error('The plugin system is disabled.')
++  }
++  const listing = await state.catalog.findPlugin(sourceId, pluginKey)
++  const reason = listing
++    ? unavailableReason(listing, state.hostVersion)
++    : 'Plugin is absent from the official catalog.'
++  if (!listing?.release || reason) {
++    throw new Error(reason ?? 'The official listing has no pinned release.')
++  }
++  return listing.release
++}
++
++function settingHost(service: PluginService) {
++  return {
++    findValidPlugin: (pluginKey: string) => service.findValidPlugin(pluginKey),
++    userDataPath: service.options.userDataPath,
++    dataChanged: (pluginKey: string, key: string) =>
++      service.panelBridge.dataChanged(pluginKey, 'settings', key)
++  }
++}
++
++function panelOwner(service: PluginService, context: RpcContext): string | null {
++  const { connectionId, signal } = context
++  if (!connectionId || signal?.aborted) {
++    return null
++  }
++  const key = `runtime:${connectionId}`
++  service.panels.bindOwnerSignal(key, signal)
++  return key
++}
++
++const permission = 'host-admin' as const
++export const ORCAD_DATA_PLUGIN_METHODS = [
++  defineMethod({
++    name: 'dataPlugins.status',
++    permission,
++    params: null,
++    handler: () =>
++      active && {
++        capabilities,
++        hostVersion: active.hostVersion,
++        revision: active.revision,
++        enabled: active.service.options.isPluginSystemEnabled(),
++        disabledPlugins: active.service.options.getDisabledPlugins()
++      }
++  }),
++  defineMethod({
++    name: 'dataPlugins.setSystemEnabled',
++    permission,
++    params: DataPluginSystemParams,
++    handler: ({ enabled }) =>
++      mutate(async ({ store, service }) => {
++        store.updateSettings({ pluginSystemEnabled: enabled }, { notifyListeners: true })
++        await service.whenReady()
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.catalog',
++    permission,
++    params: DataPluginCatalogParams,
++    handler: async ({ refresh }) => {
++      const { catalog, hostVersion } = await host()
++      const seeded = await catalog.seedOfficialSource()
++      const status = refresh
++        ? await catalog.refreshSourceShared(seeded.id)
++        : ((await catalog.listSources()).find(({ id }) => id === seeded.id) ?? seeded)
++      if (!status.marketplace) {
++        throw new Error(status.error ?? 'The official catalog is unavailable.')
++      }
++      const listings = await catalog.listPlugins()
++      return {
++        warning: status.error,
++        entries: listings
++          .filter((listing) => listing.marketplaceSourceId === seeded.id)
++          .map((listing) => ({
++            pluginKey: listing.pluginKey,
++            marketplaceSourceId: listing.marketplaceSourceId,
++            name: listing.name ?? listing.pluginKey,
++            version: listing.version,
++            description: listing.description,
++            unavailable: unavailableReason(listing, hostVersion)
++          }))
++      }
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.preview',
++    permission,
++    params: DataPluginPreviewParams,
++    handler: async ({ marketplaceSourceId, pluginKey }) => {
++      const state = await host()
++      await catalogRelease(state, marketplaceSourceId, pluginKey)
++      const preview = await state.installer.preview(marketplaceSourceId, pluginKey)
++      const hostUnavailableReason = pluginManifestUnavailableReason(preview.manifest)
++      return hostUnavailableReason ? { ...preview, hostUnavailableReason } : preview
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.install',
++    permission,
++    params: DataPluginInstallParams,
++    handler: (params) =>
++      mutate(async (state) => {
++        const release = await catalogRelease(state, params.marketplaceSourceId, params.pluginKey)
++        if (
++          (params.contentHash !== undefined && release.contentHash !== params.contentHash) ||
++          release.commit !== params.resolvedCommit
++        ) {
++          throw new Error('The release changed after review.')
++        }
++        const { service, store } = state
++        return installCatalogReleaseWithApproval({
++          pluginKey: params.pluginKey,
++          pluginService: service,
++          install: () =>
++            state.installer.install(params, {
++              manifestError: pluginManifestUnavailableReason
++            }),
++          approve: (pluginKey, reviewedFingerprint) =>
++            applyPluginConsent({
++              store,
++              pluginService: service,
++              pluginKey,
++              reviewedFingerprint,
++              decision: 'approve'
++            }),
++          ...(params.enableIfData && params.expectedFingerprint
++            ? { enableIfData: { expectedFingerprint: params.expectedFingerprint } }
++            : {})
++        })
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.list',
++    permission,
++    params: null,
++    handler: async () => {
++      const { service } = await host(false)
++      return service.options.isPluginSystemEnabled() ? listPluginsForClients(service) : []
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.setEnabled',
++    permission,
++    params: DataPluginEnablementParams,
++    handler: ({ pluginKey, enabled, reviewedFingerprint }) =>
++      mutate(async ({ store, service }) => {
++        if (enabled && reviewedFingerprint) {
++          await applyPluginConsent({
++            store,
++            pluginService: service,
++            pluginKey,
++            reviewedFingerprint,
++            decision: 'approve'
++          })
++          return listPluginsForClients(service)
++        }
++        await applyPluginEnablement({
++          store,
++          pluginService: service,
++          pluginKey,
++          enabled
++        })
++        return listPluginsForClients(service)
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.consent',
++    permission,
++    params: DataPluginConsentParams,
++    handler: (request) =>
++      mutate(async ({ store, service }) => {
++        await applyPluginConsent({ store, pluginService: service, ...request })
++        return listPluginsForClients(service)
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.sources',
++    permission,
++    params: null,
++    handler: async () => {
++      const { catalog } = await host()
++      await catalog.seedOfficialSource()
++      return (await catalog.listSources()).filter((source) => source.official)
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.listings',
++    permission,
++    params: null,
++    handler: async () => {
++      const { catalog, hostVersion } = await host()
++      await catalog.seedOfficialSource()
++      return (await catalog.listPlugins())
++        .filter((listing) => listing.official)
++        .map((listing) => ({
++          ...listing,
++          hostUnavailableReason: listing.blockedByKillList
++            ? undefined
++            : (unavailableReason(listing, hostVersion) ?? undefined)
++        }))
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.refreshSources',
++    permission,
++    params: null,
++    handler: async () => {
++      const { catalog } = await host()
++      const source = await catalog.seedOfficialSource()
++      await catalog.refreshSourceShared(source.id)
++      return (await catalog.listSources()).filter((source) => source.official)
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.refresh',
++    permission,
++    params: null,
++    handler: () =>
++      mutate(async ({ service }) => {
++        await service.refresh()
++        return listPluginsForClients(service)
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.manifest',
++    permission,
++    params: DataPluginKeyParams,
++    handler: async ({ pluginKey }) =>
++      (await host(false)).service.findValidPlugin(pluginKey)?.manifest ?? null
++  }),
++  defineMethod({
++    name: 'dataPlugins.logs',
++    permission,
++    params: DataPluginKeyParams,
++    handler: async ({ pluginKey }) => (await host(false)).service.getLogs(pluginKey)
++  }),
++  defineMethod({
++    name: 'dataPlugins.previewUpdate',
++    permission,
++    params: DataPluginKeyParams,
++    handler: async ({ pluginKey }) => {
++      const state = await host()
++      await refreshInstalledPluginCatalog(
++        { installer: state.installer, marketplace: state.catalog },
++        pluginKey
++      )
++      const update = await state.installer.findInstalledUpdateListing(pluginKey)
++      if (!update) {
++        throw new Error('This plugin has no catalog source.')
++      }
++      await catalogRelease(state, update.listing.marketplaceSourceId, pluginKey)
++      const preview = await state.installer.previewInstalledUpdate(pluginKey)
++      const installed = state.service.findValidPlugin(pluginKey)
++      return installed
++        ? { ...preview, accessGrowth: await readPreviewAccessGrowth(installed, preview) }
++        : preview
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.rollbackVersion',
++    permission,
++    params: DataPluginKeyParams,
++    handler: async ({ pluginKey }) => (await host(false)).installer.rollbackVersion(pluginKey)
++  }),
++  defineMethod({
++    name: 'dataPlugins.rollback',
++    permission,
++    params: DataPluginKeyParams,
++    handler: ({ pluginKey }) =>
++      mutate(async ({ installer, service }) => {
++        const result = await installer.rollback(pluginKey)
++        await service.refresh()
++        return result
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.remove',
++    permission,
++    params: DataPluginKeyParams,
++    handler: ({ pluginKey }) =>
++      mutate(async ({ store, service }) => {
++        if (
++          !(await uninstallInstalledPlugin({
++            store,
++            pluginService: service,
++            pluginKey
++          }))
++        ) {
++          throw new Error('This plugin cannot be uninstalled.')
++        }
++        return listPluginsForClients(service)
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.getSettings',
++    permission,
++    params: DataPluginKeyParams,
++    handler: async ({ pluginKey }) =>
++      readPluginDeclaredSettings(settingHost((await host(false)).service), pluginKey)
++  }),
++  defineMethod({
++    name: 'dataPlugins.setSetting',
++    permission,
++    params: DataPluginSettingParams,
++    handler: ({ pluginKey, key, value }) =>
++      mutate(({ service }) =>
++        Promise.resolve(writePluginDeclaredSetting(settingHost(service), pluginKey, key, value))
++      )
++  }),
++  defineMethod({
++    name: 'dataPlugins.resolveGitSource',
++    permission,
++    params: DataPluginResolveGitParams,
++    handler: async (source) => {
++      await host()
++      return resolvePluginGitSource(source)
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.installSource',
++    permission,
++    params: DataPluginInstallSourceParams,
++    handler: (source) =>
++      mutate(async ({ service, hostVersion }) => {
++        if (!service.options.isPluginSystemEnabled()) {
++          throw new Error('The plugin system is disabled.')
++        }
++        if (source.kind === 'local-path' && !isAbsolute(source.path)) {
++          return { ok: false, error: 'Enter an absolute plugin folder path.' }
++        }
++        const options = {
++          pluginsDir: getUserPluginsDir(service.options.userDataPath),
++          hostVersion,
++          blockedPluginReason: (key: string) =>
++            service.options.getPluginKillListEntry?.(key)?.reason ?? null,
++          manifestError: pluginManifestUnavailableReason
++        }
++        const result =
++          source.kind === 'local-path'
++            ? await installPluginFromLocalPath({ ...options, sourcePath: source.path })
++            : await installPluginFromGit({ ...options, ...source })
++        if (result.ok) {
++          await service.refresh()
++        }
++        return result
++      })
++  }),
++  defineMethod({
++    name: 'dataPlugins.invokeCommand',
++    permission,
++    params: DataPluginInvokeParams,
++    handler: async ({ pluginKey, commandId, args, timeoutMs }) => {
++      const startBy = timeoutMs === undefined ? undefined : Date.now() + timeoutMs
++      return (await host()).service.invokeCommand(pluginKey, commandId, args, startBy)
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.readPanelEntry',
++    permission,
++    params: PluginReadPanelEntryParams,
++    handler: async ({ pluginKey, panelId }, context) => {
++      const { service } = await host()
++      const owner = panelOwner(service, context)
++      return owner && service.panels.open(owner, pluginKey, panelId, () => !context.signal?.aborted)
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.readCustomEditorEntry',
++    permission,
++    params: DataPluginEditorParams,
++    handler: async ({ pluginKey, editorId }, context) => {
++      const { service } = await host()
++      const owner = panelOwner(service, context)
++      return (
++        owner &&
++        service.panels.openCustomEditor(owner, pluginKey, editorId, () => !context.signal?.aborted)
++      )
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.panelAction',
++    permission,
++    params: PluginsPanelActionParams,
++    handler: async (params, context) => {
++      const { service } = await host()
++      const owner = panelOwner(service, context)
++      return owner
++        ? service.panels.execute(owner, params)
++        : {
++            ok: false,
++            code: 'invalid_request',
++            error: 'invalid panel session'
++          }
++    }
++  }),
++  defineStreamingMethod({
++    name: 'dataPlugins.panelPush',
++    permission,
++    params: DataPluginPushParams,
++    handler: async ({ sessionToken, subscriptionId }, context, emit) => {
++      const { service } = await host()
++      const owner = panelOwner(service, context)
++      const session = owner && service.panels.sessionCaller(owner, sessionToken)
++      if (!session) {
++        throw new Error('Invalid panel session.')
++      }
++      await new Promise<void>((resolve) => {
++        const stop = service.panelBridge.open(session.caller, session.pluginKey, (push) =>
++          emit({ type: 'push', push })
++        )
++        context.runtime.registerSubscriptionCleanup(
++          `runtime-plugin-panel-${context.connectionId}-${subscriptionId}`,
++          () => {
++            stop()
++            resolve()
++          },
++          context.connectionId
++        )
++        emit({ type: 'ready' })
++      })
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.closePanelPush',
++    permission,
++    params: DataPluginPushCloseParams,
++    handler: ({ subscriptionId }, context) => {
++      if (context.connectionId) {
++        context.runtime.cleanupSubscription(
++          `runtime-plugin-panel-${context.connectionId}-${subscriptionId}`
++        )
++      }
++    }
++  }),
++  defineMethod({
++    name: 'dataPlugins.themes',
++    permission,
++    params: null,
++    handler: async () =>
++      (await host(false)).service.contentPacks.themes
++        .list()
++        // Relative image/video files use Electron’s plugin media protocol on desktop.
++        .map(({ background: _background, ...theme }) => theme)
++  }),
++  defineMethod({
++    name: 'dataPlugins.terminalThemes',
++    permission,
++    params: null,
++    handler: async () => (await host(false)).service.contentPacks.terminalThemes.list()
++  }),
++  defineMethod({
++    name: 'dataPlugins.iconThemes',
++    permission,
++    params: null,
++    handler: async () => (await host(false)).service.contentPacks.iconThemes.list()
++  }),
++  defineMethod({
++    name: 'dataPlugins.loadIconTheme',
++    permission,
++    params: DataPluginArtifactParams,
++    handler: async ({ id }) => (await host()).service.contentPacks.iconThemes.load(id)
++  }),
++  defineMethod({
++    name: 'dataPlugins.syntaxes',
++    permission,
++    params: null,
++    handler: async () => (await host(false)).service.contentPacks.syntaxes.list()
++  }),
++  defineMethod({
++    name: 'dataPlugins.loadSyntax',
++    permission,
++    params: DataPluginArtifactParams,
++    handler: async ({ id }) => (await host()).service.contentPacks.syntaxes.load(id)
++  }),
++  defineMethod({
++    name: 'dataPlugins.languagePacks',
++    permission,
++    params: null,
++    handler: async () => (await host(false)).service.contentPacks.languagePacks.list()
++  }),
++  defineMethod({
++    name: 'dataPlugins.newFileTemplate',
++    permission,
++    params: DataPluginNewFileParams,
++    handler: async ({ pluginKey, newFileId }) =>
++      readApprovedPluginNewFileTemplate((await host()).service, pluginKey, newFileId)
++  })
++]
+diff --git a/src/main/orcad/runtime-launch/orcad-bundled-runtime.ts b/src/main/orcad/runtime-launch/orcad-bundled-runtime.ts
+index 5e261b60..6bb5f5b6 100644
+--- a/src/main/orcad/runtime-launch/orcad-bundled-runtime.ts
++++ b/src/main/orcad/runtime-launch/orcad-bundled-runtime.ts
+@@ -55,12 +55,26 @@ export function resolveBundledOrcadSlot(script = process.argv[1]): string {
+ }
+ 
+ export function isRunningAsBundledOrcadRuntime(directory: string): boolean {
++  // The Tauri extractor runs its own Bun/SQLite/PTY qualification.
++  if (isPinnedTauriBun(directory)) {
++    return false
++  }
+   const runtime = resolveBundledOrcadRuntime(directory)
+   return runtime !== null && realpathSync(process.execPath) === realpathSync(runtime)
+ }
+ 
+ /** Reject substituted runtimes before opening profile state. */
++function isPinnedTauriBun(directory = resolveBundledOrcadSlot()): boolean {
++  return (
++    process.versions.bun === '1.4.4' &&
++    realpathSync(process.execPath) === join(directory, '../runtimes/bun-1.4.4/bun')
++  )
++}
++
+ export function assertOrcadServerRuntime(): void {
++  if (isPinnedTauriBun()) {
++    return
++  }
+   if (Number(process.versions.node.split('.')[0]) < 24) {
+     throw new OrcadBundledRuntimeError('The Orca server requires Node.js 24 or newer')
+   }
+diff --git a/src/main/plugins/catalog/plugin-marketplace-installer.ts b/src/main/plugins/catalog/plugin-marketplace-installer.ts
+index aed6c777..ecbcf411 100644
+--- a/src/main/plugins/catalog/plugin-marketplace-installer.ts
++++ b/src/main/plugins/catalog/plugin-marketplace-installer.ts
+@@ -158,7 +158,11 @@ export class PluginMarketplaceInstaller {
+ 
+   async install(
+     preview: PluginMarketplacePreviewIdentity,
+-    options: { requireInstalled?: boolean; trigger?: PluginInstallTrigger } = {}
++    options: {
++      requireInstalled?: boolean
++      trigger?: PluginInstallTrigger
++      manifestError?: (manifest: PluginManifest) => string | null
++    } = {}
+   ): Promise<PluginMarketplaceInstallResult> {
+     const listing = await this.requireListing(preview.marketplaceSourceId, preview.pluginKey)
+     const blockedReason =
+@@ -201,6 +205,7 @@ export class PluginMarketplaceInstaller {
+       },
+       ...(listing.release ? { release: listing.release } : {}),
+       blockedPluginReason: this.blockedPluginReason,
++      manifestError: options.manifestError,
+       ...(options.requireInstalled ? { requireInstalled: true } : {})
+     })
+     if (result.ok) {
+diff --git a/src/main/plugins/events/plugin-worktree-lifecycle.ts b/src/main/plugins/events/plugin-worktree-lifecycle.ts
+new file mode 100644
+index 00000000..f72b0242
+--- /dev/null
++++ b/src/main/plugins/events/plugin-worktree-lifecycle.ts
+@@ -0,0 +1,36 @@
++import { parseWorkspaceKey } from '../../../shared/workspace/identity/workspace-scope'
++import { shortPluginBranchName } from '../../../shared/plugins/events/plugin-events'
++import { notifyWorkspaceCreatedPluginHook } from '../hooks/workspace-create-plugin-hook'
++import { pluginListedWorkspaceId } from '../workers/host-api/plugin-workspace-projection'
++import type { RuntimeWorktreeLifecycleEvent } from '../../runtime/workspaces/lifecycle/worktree-lifecycle-event'
++import type { PluginService } from '../plugin-service'
++
++export function emitWorktreeLifecycleForPlugins(
++  service: Pick<PluginService, 'emitEvent'> | null | undefined,
++  event: RuntimeWorktreeLifecycleEvent
++): void {
++  const folder = parseWorkspaceKey(event.worktreeId)?.type === 'folder'
++  if (event.kind === 'created') {
++    notifyWorkspaceCreatedPluginHook({ ...event, folder })
++  }
++  // Public worktree events retain their Git-only scope.
++  if (folder) {
++    return
++  }
++  const workspaceListId = pluginListedWorkspaceId({
++    id: event.worktreeId,
++    identityKey: event.identityKey
++  })
++  const identity = {
++    workspaceId: event.worktreeId,
++    ...(workspaceListId ? { workspaceListId } : {}),
++    kind: 'worktree',
++    path: event.path
++  }
++  service?.emitEvent(
++    event.kind === 'created' ? 'workspace.created' : 'workspace.removed',
++    event.kind === 'created'
++      ? { ...identity, branch: shortPluginBranchName(event.branch) }
++      : identity
++  )
++}
+diff --git a/src/main/plugins/installation/plugin-install.ts b/src/main/plugins/installation/plugin-install.ts
+index ef2362bd..d7f8cfc4 100644
+--- a/src/main/plugins/installation/plugin-install.ts
++++ b/src/main/plugins/installation/plugin-install.ts
+@@ -52,6 +52,7 @@ export async function installPluginFromLocalPath(input: {
+   pluginsDir: string
+   sourcePath: string
+   hostVersion: string
++  manifestError?: (manifest: PluginManifest) => string | null
+   blockedPluginReason?: (pluginKey: string) => string | null
+ }): Promise<PluginInstallResult> {
+   return serializePluginMutation(input.pluginsDir, async () => {
+@@ -71,6 +72,7 @@ export async function installPluginFromLocalPath(input: {
+       identity: {
+         publisher: reinstall ?? localPluginPublisher(await declaredPublisher(input.sourcePath))
+       },
++      manifestError: input.manifestError,
+       blockedPluginReason: input.blockedPluginReason
+     })
+   })
+@@ -110,6 +112,7 @@ export async function installPluginFromGit(input: {
+   /** Commit the user was shown before installing; a ref that moved since fails. */
+   expectedCommit?: string
+   hostVersion: string
++  manifestError?: (manifest: PluginManifest) => string | null
+   blockedPluginReason?: (pluginKey: string) => string | null
+ }): Promise<PluginInstallResult> {
+   if (!isAllowedPluginGitUrl(input.url)) {
+@@ -149,6 +152,7 @@ export async function installPluginFromGit(input: {
+         source: { kind: 'git', url: input.url, ref },
+         resolvedCommit,
+         identity: { publisher },
++        manifestError: input.manifestError,
+         blockedPluginReason: input.blockedPluginReason
+       })
+     } catch (error) {
+diff --git a/src/main/plugins/plugin-service-options.ts b/src/main/plugins/plugin-service-options.ts
+index 52273fee..f4d91360 100644
+--- a/src/main/plugins/plugin-service-options.ts
++++ b/src/main/plugins/plugin-service-options.ts
+@@ -9,6 +9,10 @@ import type { PluginEditorTypographySource } from './appearance/plugin-editor-ty
+ export type PluginServiceOptions = {
+   userDataPath: string
+   hostVersion: string
++  headless?: boolean
++  admitManifest?: (
++    manifest: import('../../shared/plugins/manifest/plugin-manifest').PluginManifest
++  ) => boolean
+   isPluginSystemEnabled: () => boolean
+   getDisabledPlugins: () => string[]
+   getPluginConsents: () => Record<string, string>
+diff --git a/src/main/plugins/plugin-service.ts b/src/main/plugins/plugin-service.ts
+index 19781581..11274b7a 100644
+--- a/src/main/plugins/plugin-service.ts
++++ b/src/main/plugins/plugin-service.ts
+@@ -188,14 +188,19 @@ export class PluginService {
+       return
+     }
+     // Publish identity before shutdown so triggers cannot restart old code.
+-    this.installed.discovered = next
++    const admitted = this.options.admitManifest
++      ? next.filter((plugin) => 'error' in plugin || this.options.admitManifest?.(plugin.manifest))
++      : next
++    this.installed.discovered = admitted
+     await this.contentPacks.reconcile(
+-      next,
++      admitted,
+       (plugin) => isPluginApproved(enabled, plugin, consentLists),
+       this.options.getKeybindings?.()
+     )
+     this.contentPacksReady = true
+-    const nextSpecs = collectApprovedWorkerSpecs(next, (plugin) => this.isRuntimeApproved(plugin))
++    const nextSpecs = collectApprovedWorkerSpecs(admitted, (plugin) =>
++      this.isRuntimeApproved(plugin)
++    )
+     // Notify before slow shutdown so feature-off unmounts panels immediately.
+     this.notifyChanged(true)
+     await this.workerController.reconcile(nextSpecs, (key) => this.findValidPlugin(key))
+diff --git a/src/main/plugins/runtime/plugin-service-host-call.ts b/src/main/plugins/runtime/plugin-service-host-call.ts
+index 208b261c..62db5da6 100644
+--- a/src/main/plugins/runtime/plugin-service-host-call.ts
++++ b/src/main/plugins/runtime/plugin-service-host-call.ts
+@@ -2,10 +2,7 @@ import { capabilityKinds } from '../../../shared/plugins/capabilities/plugin-cap
+ import type { ValidDiscoveredPlugin } from '../discovery/plugin-discovery'
+ import type { PluginAuditLog } from '../logging/plugin-audit-log'
+ import type { PluginHostCallPolicy } from '../workers/host-api/plugin-host-call-adapter'
+-import {
+-  bindPluginHostServices,
+-  type PluginRuntimeDelegate
+-} from '../workers/host-api/plugin-host-service-bindings'
++import type { PluginRuntimeDelegate } from '../workers/host-api/plugin-host-service-bindings'
+ import type { PluginDesktopFrameServices } from '../workers/host-api/plugin-host-method-bindings'
+ import {
+   pluginHostCallRevoked,
+@@ -65,7 +62,7 @@ export function createPluginHostCallScope(
+   }
+ }
+ 
+-export function resolvePluginServiceHostCallPolicy(input: {
++export async function resolvePluginServiceHostCallPolicy(input: {
+   pluginKey: string
+   caller: PluginHostCaller | undefined
+   findApprovedPlugin: FindApprovedPlugin
+@@ -74,31 +71,42 @@ export function resolvePluginServiceHostCallPolicy(input: {
+   desktop: PluginDesktopFrameServices | null | undefined
+   panels: PluginPanelBridgeServices | null
+   /** The service's desktop sinks; each is absent where this Orca has none. */
+-  sinks: Pick<PluginServiceOptions, 'statusBar' | 'appearance' | 'editorTypography'>
++  sinks: Pick<PluginServiceOptions, 'statusBar' | 'appearance' | 'editorTypography' | 'headless'>
+   audit: PluginAuditLog
+   log?: (pluginKey: string) => (line: string) => void
+-}): PluginHostCallPolicy {
++}): Promise<PluginHostCallPolicy> {
++  const bind = input.runtimeDelegate
++    ? (await import('../workers/host-api/plugin-host-service-bindings')).bindPluginHostServices
++    : null
++  const secrets =
++    bind && !input.sinks.headless
++      ? (await import('../storage/plugin-secrets-store')).bindDesktopPluginSecrets(
++          input.pluginsDataDir
++        )
++      : undefined
+   const plugin = input.findApprovedPlugin(input.pluginKey)
+   return {
+     grantedCapabilities: plugin ? capabilityKinds(plugin.manifest.capabilities) : null,
+     allowProposed: plugin?.isDev === true,
+-    services: input.runtimeDelegate
+-      ? bindPluginHostServices({
+-          delegate: input.runtimeDelegate,
+-          pluginsDataDir: input.pluginsDataDir,
+-          desktop: input.desktop,
+-          panels: input.panels,
+-          renderer: getPluginHostRendererActions(),
+-          declaredSettings: plugin?.manifest.contributes.settings,
+-          statusBar: input.sinks.statusBar,
+-          appearance: input.sinks.appearance,
+-          editorTypography: input.sinks.editorTypography,
+-          declaredStatusBarItemIds: plugin?.manifest.contributes.statusBarItems.map(
+-            (item) => item.id
+-          ),
+-          statusBarRevision: plugin ? pluginStatusBarRevision(plugin) : undefined
+-        })
+-      : null,
++    services:
++      input.runtimeDelegate && bind
++        ? bind({
++            delegate: input.runtimeDelegate,
++            pluginsDataDir: input.pluginsDataDir,
++            desktop: input.desktop,
++            secrets,
++            panels: input.panels,
++            renderer: getPluginHostRendererActions(),
++            declaredSettings: plugin?.manifest.contributes.settings,
++            statusBar: input.sinks.statusBar,
++            appearance: input.sinks.appearance,
++            editorTypography: input.sinks.editorTypography,
++            declaredStatusBarItemIds: plugin?.manifest.contributes.statusBarItems.map(
++              (item) => item.id
++            ),
++            statusBarRevision: plugin ? pluginStatusBarRevision(plugin) : undefined
++          })
++        : null,
+     audit: input.audit,
+     scope: plugin
+       ? createPluginHostCallScope(
+@@ -130,7 +138,7 @@ export type PluginServiceHostCall = (
+ 
+ /** PluginService's one host-call entry: authenticate the request, then bind policy per call. */
+ export function createPluginServiceHostCall(
+-  policy: (pluginKey: string, caller: PluginHostCaller | undefined) => PluginHostCallPolicy
++  policy: (pluginKey: string, caller: PluginHostCaller | undefined) => Promise<PluginHostCallPolicy>
+ ): PluginServiceHostCall {
+   return (pluginKey, method, params, surface, caller) =>
+     executePluginHostCallRequest({
+diff --git a/src/main/plugins/storage/plugin-secrets-store.ts b/src/main/plugins/storage/plugin-secrets-store.ts
+index 8d04e2cc..6b2bfb09 100644
+--- a/src/main/plugins/storage/plugin-secrets-store.ts
++++ b/src/main/plugins/storage/plugin-secrets-store.ts
+@@ -1,3 +1,4 @@
++import type { PluginHostServices } from '../workers/host-api/plugin-host-method-bindings'
+ import { existsSync, readFileSync, statSync } from 'node:fs'
+ import { join } from 'node:path'
+ import { guardedSafeStorage as safeStorage } from '../../host/safe-storage-availability'
+@@ -133,3 +134,15 @@ export class PluginSecretsStore {
+     }
+   }
+ }
++
++/** The desktop vault bindings are loaded only in the process that owns Electron safeStorage. */
++export function bindDesktopPluginSecrets(pluginsDataDir: string): PluginHostServices['secrets'] {
++  return {
++    get: (key: string, itemKey: string) => new PluginSecretsStore(pluginsDataDir, key).get(itemKey),
++    set: (key: string, itemKey: string, value: string) =>
++      new PluginSecretsStore(pluginsDataDir, key).set(itemKey, value),
++    delete: (key: string, itemKey: string) =>
++      new PluginSecretsStore(pluginsDataDir, key).delete(itemKey),
++    protection: () => (pluginSecretsProtection().level === 'os' ? 'os-keyring' : 'unavailable')
++  }
++}
+diff --git a/src/main/plugins/workers/host-api/plugin-host-service-bindings.ts b/src/main/plugins/workers/host-api/plugin-host-service-bindings.ts
+index d63b4f35..2abb396b 100644
+--- a/src/main/plugins/workers/host-api/plugin-host-service-bindings.ts
++++ b/src/main/plugins/workers/host-api/plugin-host-service-bindings.ts
+@@ -9,7 +9,6 @@ import {
+   type PluginSettingContribution
+ } from '../../../../shared/plugins/contributions/plugin-settings-contribution'
+ import { pluginSettingDefaults } from '../../../../shared/plugins/contributions/plugin-settings-values'
+-import { PluginSecretsStore, pluginSecretsProtection } from '../../storage/plugin-secrets-store'
+ import { PluginKvStore } from '../../storage/plugin-storage-store'
+ import type { TerminalInputKind } from '../../../../shared/terminal/input/terminal-input-kind'
+ import { pluginTerminalTitle, type PluginAgentStatusRow } from './plugin-workspace-projection'
+@@ -58,6 +57,7 @@ export type PluginRuntimeDelegate = {
+ export function bindPluginHostServices(input: {
+   delegate: PluginRuntimeDelegate
+   pluginsDataDir: string
++  secrets?: PluginHostServices['secrets']
+   desktop?: PluginDesktopFrameServices | null
+   panels?: PluginPanelBridgeServices | null
+   renderer?: PluginHostRendererActions | null
+@@ -133,11 +133,11 @@ export function bindPluginHostServices(input: {
+         new PluginKvStore(pluginsDataDir, key, 'storage.json').delete(itemKey),
+       keys: (key) => new PluginKvStore(pluginsDataDir, key, 'storage.json').keys()
+     },
+-    secrets: {
+-      get: (key, itemKey) => new PluginSecretsStore(pluginsDataDir, key).get(itemKey),
+-      set: (key, itemKey, value) => new PluginSecretsStore(pluginsDataDir, key).set(itemKey, value),
+-      delete: (key, itemKey) => new PluginSecretsStore(pluginsDataDir, key).delete(itemKey),
+-      protection: () => (pluginSecretsProtection().level === 'os' ? 'os-keyring' : 'unavailable')
++    secrets: input.secrets ?? {
++      get: () => ({ ok: false, error: 'OS-backed plugin secret storage is unavailable' }),
++      set: () => ({ ok: false, error: 'OS-backed plugin secret storage is unavailable' }),
++      delete: () => {},
++      protection: () => 'unavailable'
+     },
+     settings: {
+       getAll: (key) => ({
+diff --git a/src/main/plugins/workers/plugin-host-entry.ts b/src/main/plugins/workers/plugin-host-entry.ts
+index 1753f8a0..d8f36139 100644
+--- a/src/main/plugins/workers/plugin-host-entry.ts
++++ b/src/main/plugins/workers/plugin-host-entry.ts
+@@ -10,7 +10,8 @@ function sendToParent(message: PluginEnvelope): void {
+ 
+ const runtime = createPluginWorkerRuntime({
+   send: sendToParent,
+-  prepareModuleLoading: registerPluginWorkerSourceHooks
++  // Bun resolves and transpiles TypeScript imports with its own loader.
++  prepareModuleLoading: process.versions.bun ? undefined : registerPluginWorkerSourceHooks
+ })
+ 
+ process.on('message', (raw: unknown) => {
+diff --git a/src/main/runtime/rpc/methods/rpc-method-registry.ts b/src/main/runtime/rpc/methods/rpc-method-registry.ts
+index 8aece1c1..afd4dfc8 100644
+--- a/src/main/runtime/rpc/methods/rpc-method-registry.ts
++++ b/src/main/runtime/rpc/methods/rpc-method-registry.ts
+@@ -57,6 +57,7 @@ import { CLIENT_UI_METHODS } from './client-state/client-ui'
+ import { CLIENT_EVENT_METHODS } from './client-events/client-events'
+ import { WORKSPACE_PORT_METHODS } from './workspace-ports/workspace-ports'
+ import { LINK_PREVIEW_METHODS } from './link-preview/link-preview'
++import { ORCAD_DATA_PLUGIN_METHODS } from '../../../orcad/host-runtime/orcad-data-plugins'
+ import { PLUGIN_METHODS } from './plugins/plugins'
+ import { PLUGIN_VIEW_METHODS } from './plugins/plugin-view'
+ import { PLUGIN_DEV_EMIT_METHODS } from './plugins/plugin-dev-emit'
+@@ -231,6 +232,7 @@ const SERVICE_RPC_METHODS = [
+   ...WORKSPACE_PORT_METHODS,
+   ...LINK_PREVIEW_METHODS,
+   ...PLUGIN_METHODS,
++  ...ORCAD_DATA_PLUGIN_METHODS,
+   ...PLUGIN_VIEW_METHODS,
+   ...PLUGIN_DEV_EMIT_METHODS,
+   ...PLUGIN_DEV_REQUEST_METHODS,
+diff --git a/src/main/startup/pty-startup/main-process-pty-startup.ts b/src/main/startup/pty-startup/main-process-pty-startup.ts
+index 9aa0bcb4..0ba644af 100644
+--- a/src/main/startup/pty-startup/main-process-pty-startup.ts
++++ b/src/main/startup/pty-startup/main-process-pty-startup.ts
+@@ -1,7 +1,6 @@
+ import { installProviderProcessHost } from '../../provider-process/provider-process-spawn'
+ import { recordCodexMigrationPtySpawn } from '../../codex/history/backfill/desktop-codex-session-migration'
+ import { app } from 'electron'
+-import { parseWorkspaceKey } from '../../../shared/workspace/identity/workspace-scope'
+ import { isLocalExecutionHost } from '../../../shared/execution-host/execution-host'
+ import { classifyError } from '../../telemetry/classify-error'
+ import { track } from '../../telemetry/client'
+@@ -41,35 +40,10 @@ import { logStartupMilestone } from '../diagnostics/startup-diagnostics'
+ import type { WindowsDesktopStartupServices } from '../shell-environment/windows-desktop-shell-path-startup'
+ import type { RuntimeWorktreeLifecycleEvent } from '../../runtime/workspaces/lifecycle/worktree-lifecycle-event'
+ import { mainProcessState as state } from '../main-process-state'
+-import { shortPluginBranchName } from '../../../shared/plugins/events/plugin-events'
+-import { notifyWorkspaceCreatedPluginHook } from '../../plugins/hooks/workspace-create-plugin-hook'
+-import { pluginListedWorkspaceId } from '../../plugins/workers/host-api/plugin-workspace-projection'
++import { emitWorktreeLifecycleForPlugins } from '../../plugins/events/plugin-worktree-lifecycle'
+ 
+ export function emitPluginWorktreeLifecycle(event: RuntimeWorktreeLifecycleEvent): void {
+-  const folder = parseWorkspaceKey(event.worktreeId)?.type === 'folder'
+-  if (event.kind === 'created') {
+-    notifyWorkspaceCreatedPluginHook({ ...event, folder })
+-  }
+-  // Public worktree events retain their Git-only scope.
+-  if (folder) {
+-    return
+-  }
+-  const workspaceListId = pluginListedWorkspaceId({
+-    id: event.worktreeId,
+-    identityKey: event.identityKey
+-  })
+-  const identity = {
+-    workspaceId: event.worktreeId,
+-    ...(workspaceListId ? { workspaceListId } : {}),
+-    kind: 'worktree',
+-    path: event.path
+-  }
+-  state.pluginService?.emitEvent(
+-    event.kind === 'created' ? 'workspace.created' : 'workspace.removed',
+-    event.kind === 'created'
+-      ? { ...identity, branch: shortPluginBranchName(event.branch) }
+-      : identity
+-  )
++  emitWorktreeLifecycleForPlugins(state.pluginService, event)
+ }
+ 
+ export function handleCodexHomePtySpawned(args: {
+diff --git a/src/preload/api/plugins/plugin-host-api.ts b/src/preload/api/plugins/plugin-host-api.ts
+index 9b52cc6e..4b8e495e 100644
+--- a/src/preload/api/plugins/plugin-host-api.ts
++++ b/src/preload/api/plugins/plugin-host-api.ts
+@@ -84,6 +84,7 @@ export type PluginMarketplaceHostSourceState = {
+ }
+ 
+ export type PluginMarketplaceHostListing = {
++  hostUnavailableReason?: string
+   marketplaceSourceId: string
+   marketplaceName: string
+   marketplaceOwner: string
+@@ -122,6 +123,7 @@ export type PluginFileTypeHostSuggestion = {
+ }
+ 
+ export type PluginMarketplaceHostInstallPreview = {
++  hostUnavailableReason?: string
+   marketplaceSourceId: string
+   marketplaceName: string
+   marketplaceOwner: string
+@@ -143,7 +145,34 @@ export type PluginMarketplaceHostInstallPreview = {
+   repositoryMoved?: true
+ }
+ 
++export type DataPluginStatus = {
++  hostVersion?: string
++  capabilities: readonly string[]
++  revision: number
++  enabled: boolean
++  disabledPlugins: string[]
++}
++
++export type DataPluginMarketplaceApi = {
++  readonly hostVersion: string | undefined
++  readonly available: boolean
++  status: () => Promise<DataPluginStatus | null>
++  setSystemEnabled: (enabled: boolean) => Promise<void>
++  catalog: (refresh: boolean) => Promise<{
++    warning?: string
++    entries: {
++      pluginKey: string
++      marketplaceSourceId: string
++      name: string
++      version?: string
++      description?: string
++      unavailable: string | null
++    }[]
++  }>
++}
++
+ export type PluginsApi = {
++  dataMarketplace?: DataPluginMarketplaceApi
+   list: () => Promise<PluginHostListEntry[]>
+   listLanguagePacks: () => Promise<PluginLanguagePackRegistration[]>
+   listThemes: () => Promise<PluginThemeRegistration[]>
+@@ -156,7 +185,11 @@ export type PluginsApi = {
+   loadSyntax: (id: string) => Promise<PluginSyntaxPayload | null>
+   /** Approval is bound to the current capability and trusted-worker fingerprint. */
+   consent: (args: PluginConsentRequest) => Promise<PluginHostListEntry[]>
+-  setEnabled: (args: { pluginKey: string; enabled: boolean }) => Promise<PluginHostListEntry[]>
++  setEnabled: (args: {
++    pluginKey: string
++    enabled: boolean
++    reviewedFingerprint?: string
++  }) => Promise<PluginHostListEntry[]>
+   /** CSP-wrapped HTML for a sandboxed iframe; null if missing or disabled. */
+   /** `theme`: the host's current one, baked into an isolated guest's first paint. */
+   readPanelEntry: (args: {
+@@ -228,6 +261,7 @@ export type PluginsApi = {
+       PluginMarketplaceHostInstallPreview,
+       'marketplaceSourceId' | 'marketplaceCommit' | 'pluginKey' | 'resolvedCommit'
+     > & {
++      contentHash?: string
+       enableIfData?: true
+       /** The preview's consentFingerprint; with it, main approves only those exact bytes. */
+       expectedFingerprint?: string
+diff --git a/src/renderer/src/components/plugins/catalog/PluginCardAction.tsx b/src/renderer/src/components/plugins/catalog/PluginCardAction.tsx
+index a5499e20..cd37114d 100644
+--- a/src/renderer/src/components/plugins/catalog/PluginCardAction.tsx
++++ b/src/renderer/src/components/plugins/catalog/PluginCardAction.tsx
+@@ -85,6 +85,9 @@ export function PluginCardAction({
+   if (entry.listing?.blockedByKillList) {
+     return <StatusWord kind="blocked" />
+   }
++  if (entry.listing?.hostUnavailableReason) {
++    return null
++  }
+   const needsOrca = needsNewerOrca(entry.minimumOrca, orcaVersion)
+   if (needsOrca) {
+     return (
+diff --git a/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx b/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx
+index bd3c616b..195a526a 100644
+--- a/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx
++++ b/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx
+@@ -111,18 +111,20 @@ export function CatalogCard({
+       notice={
+         phase?.kind === 'error'
+           ? { text: phase.message, tone: 'destructive' }
+-          : listing?.blockedByKillList && !entry.installed
+-            ? {
+-                text: t(
+-                  'auto.components.settings.PluginMarketplaceListingRow.blocked',
+-                  "Blocked by Orca's safety list: {{value0}}",
+-                  { value0: listing.blockedByKillList.reason }
+-                ),
+-                tone: 'destructive'
+-              }
+-            : installError
+-              ? { text: installError, tone: 'destructive' }
+-              : undefined
++          : listing?.hostUnavailableReason && !entry.installed
++            ? { text: listing.hostUnavailableReason, tone: 'warning' }
++            : listing?.blockedByKillList && !entry.installed
++              ? {
++                  text: t(
++                    'auto.components.settings.PluginMarketplaceListingRow.blocked',
++                    "Blocked by Orca's safety list: {{value0}}",
++                    { value0: listing.blockedByKillList.reason }
++                  ),
++                  tone: 'destructive'
++                }
++              : installError
++                ? { text: installError, tone: 'destructive' }
++                : undefined
+       }
+       chips={
+         <>
+@@ -136,7 +138,11 @@ export function CatalogCard({
+         </>
+       }
+       onOpen={() => handlers.openEntry(entry.pluginKey)}
+-      onIntent={listing && !entry.installed ? () => handlers.prefetch.intend(listing) : undefined}
++      onIntent={
++        listing && !listing.hostUnavailableReason && !entry.installed
++          ? () => handlers.prefetch.intend(listing)
++          : undefined
++      }
+       onIntentEnd={handlers.prefetch.cancel}
+       action={
+         <PluginCardAction
+@@ -257,7 +263,7 @@ export function PluginCatalogGroups({
+         const listedTotal = listed.filter(
+           (entry) => entry.listing?.marketplaceSourceId === source.id
+         ).length
+-        if (narrowed && rows.length === 0) {
++        if (narrowed && rows.length === 0 && !source.error) {
+           return null
+         }
+         const failed = Boolean(source.error)
+@@ -296,7 +302,9 @@ export function PluginCatalogGroups({
+                   ? t(
+                       'auto.components.settings.PluginManager.sourceStaleBody',
+                       'Showing the copy from {{value0}}.',
+-                      { value0: formatShortTimeAgo(source.marketplace.fetchedAt) }
++                      {
++                        value0: formatShortTimeAgo(source.marketplace.fetchedAt)
++                      }
+                     )
+                   : ''
+               }
+diff --git a/src/renderer/src/components/plugins/list/PluginCard.tsx b/src/renderer/src/components/plugins/list/PluginCard.tsx
+index 1940e2a9..85eb73db 100644
+--- a/src/renderer/src/components/plugins/list/PluginCard.tsx
++++ b/src/renderer/src/components/plugins/list/PluginCard.tsx
+@@ -1,4 +1,5 @@
+ import { BadgeCheck, Check } from 'lucide-react'
++import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import { useIntlLocale, useTranslate } from '@/i18n/use-translate'
+ import { pluginOfficialLabel } from '../presentation/plugin-official-label'
+ import { Badge } from '../../ui/badge'
+@@ -46,9 +47,11 @@ export function PluginCard({
+   const t = useTranslate()
+   const intlLocale = useIntlLocale()
+   const installCount = usePluginInstallCount(entry)
+-  const cover =
+-    servedPluginHostImages(entry.installed?.images)?.cover ??
+-    servedPluginHostImages(entry.listing?.images)?.cover
++  // The catalog's verified image URLs require the desktop protocol.
++  const cover = isWebClientLocation()
++    ? undefined
++    : (servedPluginHostImages(entry.installed?.images)?.cover ??
++      servedPluginHostImages(entry.listing?.images)?.cover)
+   return (
+     <li
+       data-plugin-key={entry.pluginKey}
+diff --git a/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx b/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx
+index 671e5ccf..db8cdd09 100644
+--- a/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx
++++ b/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx
+@@ -78,11 +78,11 @@ export function PluginCatalogLayout({
+             ) : null}
+           </TabsList>
+         </Tabs>
+-        <div className="relative min-w-56 grow @max-xl/plugin-list:order-last @max-xl/plugin-list:basis-full">
++        <div className="relative min-w-0 grow basis-56 @max-xl/plugin-list:order-last @max-xl/plugin-list:basis-full">
+           <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+           <Input
+             value={search}
+-            className="pl-9"
++            className="pr-9 pl-9"
+             aria-label={t(
+               'auto.components.pluginCatalog.PluginCatalogLayout.searchLabel',
+               'Search plugins'
+diff --git a/src/renderer/src/components/plugins/list/PluginManager.tsx b/src/renderer/src/components/plugins/list/PluginManager.tsx
+index 04bb112b..b8dcc769 100644
+--- a/src/renderer/src/components/plugins/list/PluginManager.tsx
++++ b/src/renderer/src/components/plugins/list/PluginManager.tsx
+@@ -185,7 +185,13 @@ export function PluginManager({
+     filter === 'installed' || filter === 'updates'
+       ? visibleInstalled.length
+       : visibleCatalogCount + (filter === 'all' ? uncataloged.length : 0)
+-  const nothingMatches = narrowed && resultCount === 0
++  const waitingForResults =
++    filter === 'installed' || filter === 'updates'
++      ? pluginsLoading || pluginsError
++      : catalog.loading ||
++        catalog.error ||
++        catalog.sources.some((source) => source.error && !source.marketplace)
++  const nothingMatches = narrowed && resultCount === 0 && !waitingForResults
+   const everythingInstalled =
+     filter === 'available' &&
+     !narrowed &&
+diff --git a/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx b/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx
+index 1f42f5db..799fd110 100644
+--- a/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx
++++ b/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx
+@@ -50,7 +50,11 @@ export function PluginSettingsOverview({
+   return (
+     <>
+       {featureEnabled ? null : <PluginsOffState />}
+-      {settingsError ? <p className="text-xs text-destructive">{settingsError}</p> : null}
++      {settingsError ? (
++        <p role="alert" className="text-xs text-destructive">
++          {settingsError}
++        </p>
++      ) : null}
+       {featureEnabled ? (
+         <PluginManager
+           plugins={plugins}
+diff --git a/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx b/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx
+index 2516cca3..583376ca 100644
+--- a/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx
++++ b/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx
+@@ -1,3 +1,5 @@
++import { PluginAddMenu } from './PluginAddMenu'
++import { dataPluginMarketplace } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
+ import { isPluginAutoUpdateOn } from '../../../../../shared/plugins/catalog/plugin-update-policy'
+ import { useEffect, useEffectEvent, useRef, useState } from 'react'
+ import { toast } from 'sonner'
+@@ -18,6 +20,9 @@ import { PluginsAlphaNotice } from './PluginsAlphaNotice'
+ import { PluginsSectionDescription } from './PluginsSectionDescription'
+ import { getPluginsSectionPresentation } from '../../settings/plugins/plugins-search'
+ import { SettingsSection } from '../../settings/section-layout/SettingsSection'
++import { SettingsGroup } from '../../settings/section-layout/SettingsGroup'
++import { SettingsRow } from '../../settings/form-controls/SettingsFormControls'
++import { Switch } from '../../ui/switch'
+ import { usePluginLogs } from '../state/use-plugin-logs'
+ import { usePluginMarketplaceLifecycle } from '../state/use-plugin-marketplace-lifecycle'
+ import { usePluginPageNavigation } from '../state/use-plugin-page-navigation'
+@@ -138,8 +143,10 @@ export function PluginsSettingsSection({
+ 
+   const {
+     devPathsBusy,
++    systemBusy,
+     settingsError,
+     reset: resetSettingsWrites,
++    setSystemEnabled,
+     toggleSuggestions,
+     toggleAutoUpdate,
+     updateDevPaths
+@@ -329,29 +336,68 @@ export function PluginsSettingsSection({
+   }
+ 
+   const featureEnabled = settings.pluginSystemEnabled
++  const pairedPluginHost = Boolean(dataPluginMarketplace())
++  const showingDetail = featureEnabled && page.openKey !== null
++  const switchLabel = t(
++    'auto.components.settings.PluginsSettingsSection.systemLabel',
++    'Plugin system'
++  )
+   return (
+     <SettingsSection
+       id="plugins"
+       {...sectionPresentation}
+-      description={<PluginsSectionDescription text={sectionPresentation.description} />}
+-      hideHeader={featureEnabled && page.openKey !== null}
++      badge={pairedPluginHost ? undefined : sectionPresentation.badge}
++      description={
++        pairedPluginHost ? (
++          t(
++            'auto.components.settings.PluginsSettingsSection.catalogDescription',
++            'Find extensions in the official catalog and manage the plugins you’ve installed.'
++          )
++        ) : (
++          <PluginsSectionDescription text={sectionPresentation.description} />
++        )
++      }
++      hideHeader={showingDetail}
+       bodyClassName="gap-6"
+       headerAction={
+-        <PluginsHeaderActions
+-          featureEnabled={featureEnabled}
+-          suggestionsEnabled={settings.pluginFileTypeSuggestions !== false}
+-          onToggleSuggestions={() => void toggleSuggestions()}
+-          autoUpdateEnabled={isPluginAutoUpdateOn(settings)}
+-          onToggleAutoUpdate={() => void toggleAutoUpdate()}
+-          open={settingsMenuOpen}
+-          onOpenChange={setSettingsMenuOpen}
+-          onAdd={setInstallKind}
+-          onSources={() => setSourcesOpen(true)}
+-          onDevelopment={() => setDevelopmentOpen(true)}
+-        />
++        pairedPluginHost ? (
++          <PluginAddMenu disabled={!featureEnabled || systemBusy} onChoose={setInstallKind} />
++        ) : (
++          <PluginsHeaderActions
++            featureEnabled={featureEnabled}
++            suggestionsEnabled={settings.pluginFileTypeSuggestions !== false}
++            onToggleSuggestions={() => void toggleSuggestions()}
++            autoUpdateEnabled={isPluginAutoUpdateOn(settings)}
++            onToggleAutoUpdate={() => void toggleAutoUpdate()}
++            open={settingsMenuOpen}
++            onOpenChange={setSettingsMenuOpen}
++            onAdd={setInstallKind}
++            onSources={() => setSourcesOpen(true)}
++            onDevelopment={() => setDevelopmentOpen(true)}
++          />
++        )
+       }
+     >
+-      {featureEnabled && page.openKey !== null ? null : <PluginsAlphaNotice />}
++      {!showingDetail &&
++        (pairedPluginHost ? (
++          <SettingsGroup>
++            <SettingsRow
++              label={switchLabel}
++              htmlFor="plugin-system-enabled"
++              control={
++                <Switch
++                  id="plugin-system-enabled"
++                  checked={featureEnabled}
++                  pending={systemBusy ? 'saving' : undefined}
++                  aria-disabled={systemBusy || undefined}
++                  onCheckedChange={(enabled) => void setSystemEnabled(enabled)}
++                />
++              }
++            />
++          </SettingsGroup>
++        ) : (
++          <PluginsAlphaNotice />
++        ))}
+       <PluginSettingsOverview
+         featureEnabled={featureEnabled}
+         settingsError={settingsError}
+diff --git a/src/renderer/src/components/plugins/list/plugin-list-entries.ts b/src/renderer/src/components/plugins/list/plugin-list-entries.ts
+index 1f7a0b76..7c9e2ae7 100644
+--- a/src/renderer/src/components/plugins/list/plugin-list-entries.ts
++++ b/src/renderer/src/components/plugins/list/plugin-list-entries.ts
+@@ -125,7 +125,7 @@ function newerCatalogVersion(
+   orcaVersion: string | null
+ ): string | null {
+   const version = listing ? catalogVersion(listing) : null
+-  if (!version || plugin.source?.kind !== 'marketplace') {
++  if (!version || listing?.hostUnavailableReason || plugin.source?.kind !== 'marketplace') {
+     return null
+   }
+   // Why: an update this Orca can't run isn't one to offer; Orca itself needs updating first.
+@@ -141,7 +141,12 @@ function reinstallCatalogVersion(
+   orcaVersion: string | null
+ ): string | null {
+   const release = listing?.release
+-  if (plugin.status !== 'invalid' || plugin.source?.kind !== 'marketplace' || !release) {
++  if (
++    plugin.status !== 'invalid' ||
++    plugin.source?.kind !== 'marketplace' ||
++    !release ||
++    listing?.hostUnavailableReason
++  ) {
+     return null
+   }
+   // Why bytes, not version: reinstalling the same bytes would fail the same way.
+diff --git a/src/renderer/src/components/plugins/page/PluginDetailPage.tsx b/src/renderer/src/components/plugins/page/PluginDetailPage.tsx
+index c7866d1a..95a5ee1d 100644
+--- a/src/renderer/src/components/plugins/page/PluginDetailPage.tsx
++++ b/src/renderer/src/components/plugins/page/PluginDetailPage.tsx
+@@ -90,7 +90,11 @@ export function PluginDetailPage({
+ }: PluginDetailPageProps): React.JSX.Element {
+   const t = useTranslate()
+   const intlLocale = useIntlLocale()
+-  const model = usePluginPageModel({ entry: currentEntry, fetchPreview, refreshing })
++  const model = usePluginPageModel({
++    entry: currentEntry,
++    fetchPreview,
++    refreshing
++  })
+   const { entry, plugin, listing, preview, stale } = model
+   const palettes = usePluginArtPalettes(entry.pluginKey, listing?.release?.themePreview)
+   const tooNew = needsNewerOrca(entry.minimumOrca, orcaVersion) !== null
+@@ -98,11 +102,12 @@ export function PluginDetailPage({
+   const name = entry.nameShowsPublisher
+     ? entry.name
+     : (plugin?.name ?? preview?.manifest.name ?? entry.name)
++  const hostUnavailableReason = listing?.hostUnavailableReason ?? preview?.hostUnavailableReason
+   const action = usePluginPageAction({
+     entry,
+     name,
+     model,
+-    unavailable: Boolean(listing?.blockedByKillList) || tooNew,
++    unavailable: Boolean(listing?.blockedByKillList || hostUnavailableReason) || tooNew,
+     busy,
+     install,
+     onConsent
+@@ -186,6 +191,17 @@ export function PluginDetailPage({
+         body={typeof controls.description === 'string' ? controls.description : ''}
+       />
+     )
++  } else if (!plugin && hostUnavailableReason) {
++    alert = (
++      <Alert
++        tone="info"
++        title={t(
++          'auto.components.settings.PluginDetailPage.hostUnavailable',
++          'Unavailable on this host'
++        )}
++        body={hostUnavailableReason}
++      />
++    )
+   } else if (!plugin && listing?.blockedByKillList) {
+     alert = (
+       <Alert
+diff --git a/src/renderer/src/components/plugins/state/use-plugin-install-action.ts b/src/renderer/src/components/plugins/state/use-plugin-install-action.ts
+index 248a397c..f89b534c 100644
+--- a/src/renderer/src/components/plugins/state/use-plugin-install-action.ts
++++ b/src/renderer/src/components/plugins/state/use-plugin-install-action.ts
+@@ -118,6 +118,10 @@ export function usePluginInstallAction({
+         return
+       }
+       const { preview } = read
++      if (preview.hostUnavailableReason) {
++        setPhase(pluginKey, { kind: 'error', message: preview.hostUnavailableReason })
++        return
++      }
+       if (!mountedRef.current) {
+         return
+       }
+diff --git a/src/renderer/src/components/plugins/state/use-plugin-page-model.ts b/src/renderer/src/components/plugins/state/use-plugin-page-model.ts
+index 960c5653..f28e4dcf 100644
+--- a/src/renderer/src/components/plugins/state/use-plugin-page-model.ts
++++ b/src/renderer/src/components/plugins/state/use-plugin-page-model.ts
+@@ -1,4 +1,5 @@
+ import { useEffect, useState } from 'react'
++import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import type {
+   PluginMarketplaceHostInstallPreview,
+   PluginMarketplaceHostListing
+@@ -79,7 +80,7 @@ export function usePluginPageModel({
+   const [previewAttempt, setPreviewAttempt] = useState(0)
+ 
+   useEffect(() => {
+-    if (plugin || !listing) {
++    if (plugin || !listing || listing.hostUnavailableReason || listing.blockedByKillList) {
+       return
+     }
+     let stale = false
+@@ -181,9 +182,9 @@ export function usePluginPageModel({
+         ?.filter((item) => item.kind === 'customEditors')
+         .flatMap((item) => (item.detail ? item.detail.split(', ') : [])) ?? null)
+ 
+-  const images: PluginHostImages | undefined = servedPluginHostImages(
+-    plugin?.images ?? listing?.images ?? shownPreview?.images
+-  )
++  const images: PluginHostImages | undefined = isWebClientLocation()
++    ? undefined
++    : servedPluginHostImages(plugin?.images ?? listing?.images ?? shownPreview?.images)
+   return {
+     entry: shownEntry,
+     plugin,
+diff --git a/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts b/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts
+index 5cbedcb3..00663921 100644
+--- a/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts
++++ b/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts
+@@ -1,5 +1,6 @@
+ import { pluginHostVersion } from '../../../../../shared/plugins/installation/plugin-host-version'
+ import { useCallback, useEffect, useRef, useState } from 'react'
++import { dataPluginMarketplace } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
+ 
+ function isBackShortcut(event: KeyboardEvent): boolean {
+   const mac = navigator.userAgent.includes('Mac')
+@@ -133,5 +134,5 @@ export function useOrcaVersion(): string | null {
+       stale = true
+     }
+   }, [])
+-  return version
++  return dataPluginMarketplace()?.hostVersion ?? version
+ }
+diff --git a/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts b/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts
+index eeda7204..41d82b11 100644
+--- a/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts
++++ b/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts
+@@ -1,5 +1,5 @@
+ import { isPluginAutoUpdateOn } from '../../../../../shared/plugins/catalog/plugin-update-policy'
+-import { useCallback, useState, type MutableRefObject } from 'react'
++import { useCallback, useRef, useState, type MutableRefObject } from 'react'
+ import type { GlobalSettings } from '../../../../../shared/settings/global-settings-types'
+ import { translate } from '@/i18n/i18n'
+ 
+@@ -23,6 +23,8 @@ export function usePluginSettingsWrites({
+   rediscover: () => Promise<unknown>
+ }) {
+   const [devPathsBusy, setDevPathsBusy] = useState(false)
++  const savingSystem = useRef(false)
++  const [systemBusy, setSystemBusy] = useState(false)
+   const [settingsError, setSettingsError] = useState<string | null>(null)
+ 
+   const reset = useCallback(() => {
+@@ -49,6 +51,25 @@ export function usePluginSettingsWrites({
+     }
+   }
+ 
++  const setSystemEnabled = async (enabled: boolean): Promise<void> => {
++    if (savingSystem.current) {
++      return
++    }
++    savingSystem.current = true
++    setSystemBusy(true)
++    setSettingsError(null)
++    try {
++      await updateSettings({ pluginSystemEnabled: enabled })
++    } catch {
++      if (mountedRef.current) {
++        setSettingsError(saveFailed())
++      }
++    } finally {
++      savingSystem.current = false
++      setSystemBusy(false)
++    }
++  }
++
+   const toggleSuggestions = async (): Promise<void> => {
+     setSettingsError(null)
+     try {
+@@ -77,8 +98,10 @@ export function usePluginSettingsWrites({
+ 
+   return {
+     devPathsBusy,
++    systemBusy,
+     settingsError,
+     reset,
++    setSystemEnabled,
+     toggleSuggestions,
+     toggleAutoUpdate,
+     updateDevPaths
+diff --git a/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts b/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts
+index f0c29ff9..18c52341 100644
+--- a/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts
++++ b/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts
+@@ -8,6 +8,7 @@ import { applyPluginAppThemeToSlot } from '../../../plugins/state/plugin-theme-a
+ import { createPluginPagePreviewCache } from '../../../plugins/state/use-plugin-catalog'
+ import { usePluginInstallAction } from '../../../plugins/state/use-plugin-install-action'
+ import { useTranslate, type Translate } from '../../../../i18n/use-translate'
++import { dataPluginMarketplace } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
+ 
+ type CatalogSnapshot = {
+   installed: readonly PluginHostListEntry[]
+@@ -41,6 +42,7 @@ export function catalogAppThemes(
+         !release ||
+         installedPluginKeys.has(entry.pluginKey) ||
+         listing.blockedByKillList ||
++        listing.hostUnavailableReason ||
+         // Why content only: anything that runs code is reviewed on its plugin page first.
+         release.execution !== 'data' ||
+         needsNewerOrca(entry.minimumOrca, snapshot.orcaVersion)
+@@ -88,7 +90,8 @@ function useCatalogSnapshot(): {
+     void Promise.all([plugins.list(), plugins.listMarketplacePlugins(), updater.getVersion()])
+       .then(([installed, listings, version]) => {
+         if (requestId === requestRef.current) {
+-          setSnapshot({ installed, listings, orcaVersion: pluginHostVersion(version) })
++          const orcaVersion = dataPluginMarketplace()?.hostVersion ?? pluginHostVersion(version)
++          setSnapshot({ installed, listings, orcaVersion })
+         }
+       })
+       .catch((cause: unknown) => console.warn('[plugins] catalog themes unavailable:', cause))
+diff --git a/src/renderer/src/components/settings/navigation/settings-navigation-build-options.ts b/src/renderer/src/components/settings/navigation/settings-navigation-build-options.ts
+index f0db9a4c..0f285821 100644
+--- a/src/renderer/src/components/settings/navigation/settings-navigation-build-options.ts
++++ b/src/renderer/src/components/settings/navigation/settings-navigation-build-options.ts
+@@ -9,6 +9,7 @@ export type SettingsNavigationBuildOptions = {
+   isLocalWindowsHost: boolean
+   isWindowsTerminalHost: boolean
+   isWebClient: boolean
++  webDataPluginsAvailable?: boolean
+   /** Settings › Bots › Enable bots. */
+   botsEnabled: boolean
+   hostQueuesMessages: boolean
+diff --git a/src/renderer/src/components/settings/navigation/settings-navigation-remote-sections.ts b/src/renderer/src/components/settings/navigation/settings-navigation-remote-sections.ts
+index a04eb10c..886ac6ca 100644
+--- a/src/renderer/src/components/settings/navigation/settings-navigation-remote-sections.ts
++++ b/src/renderer/src/components/settings/navigation/settings-navigation-remote-sections.ts
+@@ -30,7 +30,7 @@ import {
+ import type { SettingsNavigationBuildOptions } from './settings-navigation-build-options'
+ 
+ export function buildRemoteSettingsSections(
+-  { isMac, isWebClient, isDev }: SettingsNavigationBuildOptions,
++  { isMac, isWebClient, isDev, webDataPluginsAvailable }: SettingsNavigationBuildOptions,
+   runtimeEnvironmentsSearchEntry: SettingsNavSection['searchEntries'][number],
+   t: Translate = translate
+ ): SettingsNavSection[] {
+@@ -131,7 +131,7 @@ export function buildRemoteSettingsSections(
+       searchEntries: getExperimentalPaneSearchEntries(),
+       group: 'experimental'
+     },
+-    ...(showDesktopOnlySettings
++    ...(showDesktopOnlySettings || (isWebClient && webDataPluginsAvailable)
+       ? [
+           {
+             id: 'plugins',
+diff --git a/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts b/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts
+index 85eac5e0..72ee44ba 100644
+--- a/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts
++++ b/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts
+@@ -1,3 +1,4 @@
++import { useWebDataPluginsAvailable } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
+ import { useSupportedGroupHookSettings } from '../repository/hooks/use-supported-group-hook-settings'
+ import type { ProjectGroupSettingsEntry } from '../repository/hooks/use-supported-group-hook-settings'
+ import { useMemo } from 'react'
+@@ -57,6 +58,7 @@ export function buildSettingsNavigationMetadata(
+     isLocalWindowsHost = isWindows,
+     isWindowsTerminalHost = isWindows,
+     isWebClient,
++    webDataPluginsAvailable,
+     botsEnabled = true,
+     hostQueuesMessages = false,
+     typedChatPermissions = false,
+@@ -74,6 +76,7 @@ export function buildSettingsNavigationMetadata(
+     isLocalWindowsHost?: boolean
+     isWindowsTerminalHost?: boolean
+     isWebClient: boolean
++    webDataPluginsAvailable?: boolean
+     botsEnabled?: boolean
+     hostQueuesMessages?: boolean
+     typedChatPermissions?: boolean
+@@ -111,6 +114,7 @@ export function buildSettingsNavigationMetadata(
+     isLocalWindowsHost,
+     isWindowsTerminalHost,
+     isWebClient,
++    webDataPluginsAvailable,
+     botsEnabled,
+     hostQueuesMessages,
+     typedChatPermissions,
+@@ -162,6 +166,7 @@ export function useSettingsNavigationMetadata(): SettingsNavSection[] {
+   const isMac = isMacUserAgent()
+   const isWindows = isWindowsUserAgent()
+   const isWebClient = isWebClientLocation()
++  const webDataPluginsAvailable = useWebDataPluginsAvailable()
+   const isLinearConnected = useLinearProviderConnected()
+   const windowsTerminalCapabilityOwnerKey = useWindowsTerminalCapabilityOwnerKey(
+     settings?.activeRuntimeEnvironmentId
+@@ -200,6 +205,7 @@ export function useSettingsNavigationMetadata(): SettingsNavSection[] {
+           isLocalWindowsHost,
+           isWindowsTerminalHost,
+           isWebClient,
++          webDataPluginsAvailable,
+           botsEnabled,
+           hostQueuesMessages,
+           typedChatPermissions,
+@@ -224,6 +230,7 @@ export function useSettingsNavigationMetadata(): SettingsNavSection[] {
+       isLocalWindowsHost,
+       isWindowsTerminalHost,
+       isWebClient,
++      webDataPluginsAvailable,
+       botsEnabled,
+       hostQueuesMessages,
+       typedChatPermissions,
+diff --git a/src/renderer/src/components/settings/page/settings-advanced-section-renderers.tsx b/src/renderer/src/components/settings/page/settings-advanced-section-renderers.tsx
+index 3d163b2c..e3538b54 100644
+--- a/src/renderer/src/components/settings/page/settings-advanced-section-renderers.tsx
++++ b/src/renderer/src/components/settings/page/settings-advanced-section-renderers.tsx
+@@ -1,6 +1,7 @@
+ import { lazy, Suspense } from 'react'
+ import { AdvancedPane } from '../advanced/AdvancedPane'
+ import { ExperimentalPane } from '../advanced/ExperimentalPane'
++import { dataPluginMarketplace } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
+ import { PluginsSettingsSection } from '../../plugins/list/PluginsSettingsSection'
+ import { SettingsSection } from '../section-layout/SettingsSection'
+ import { translate } from '@/i18n/i18n'
+@@ -95,7 +96,7 @@ export function renderPluginsSettingsSection(
+   context: SettingsRenderContext
+ ): React.JSX.Element | null {
+   const { model, view } = context
+-  return model.showDesktopOnlySettings ? (
++  return model.showDesktopOnlySettings || (model.isWebClient && dataPluginMarketplace()) ? (
+     <PluginsSettingsSection
+       mounted={view.isSectionMounted('plugins')}
+       settings={model.settings}
+diff --git a/src/renderer/src/i18n/locales/zh.json b/src/renderer/src/i18n/locales/zh.json
+index 7fefdd68..6f99587f 100644
+--- a/src/renderer/src/i18n/locales/zh.json
++++ b/src/renderer/src/i18n/locales/zh.json
+@@ -12152,7 +12152,10 @@
+           "descriptionVersion": "恢复到版本 {{value0}}"
+         },
+         "PluginsSettingsSection": {
++          "turnOff": "关闭插件",
++          "turnOn": "开启插件",
+           "systemLabel": "插件系统",
++          "catalogDescription": "在官方目录发现插件，管理已安装的扩展。",
+           "loading": "正在加载插件…",
+           "noInstalledResultsTitle": "没有匹配的插件",
+           "noInstalledResults": "没有已安装的插件匹配此搜索",
+@@ -13250,6 +13253,7 @@
+           "showInstalled": "显示已安装的插件"
+         },
+         "PluginDetailPage": {
++          "hostUnavailable": "当前宿主暂不支持此插件",
+           "bundled": "随 Orca 附带",
+           "localFolder": "本地文件夹",
+           "gitUrl": "Git URL",
+diff --git a/src/renderer/src/web/main.tsx b/src/renderer/src/web/main.tsx
+index 70356dac..c3d1f05e 100644
+--- a/src/renderer/src/web/main.tsx
++++ b/src/renderer/src/web/main.tsx
+@@ -1,6 +1,6 @@
+ import '../assets/main.css'
+ 
+-import { Suspense, useMemo, useState } from 'react'
++import { Suspense, useEffect, useMemo, useState } from 'react'
+ import { lazyWithRetry as lazy } from '@/app-shell/startup/lazy-with-retry'
+ import ReactDOM from 'react-dom/client'
+ import { useTranslation } from 'react-i18next'
+@@ -17,6 +17,7 @@ import {
+   saveStoredWebRuntimeEnvironment
+ } from './pairing/web-runtime-environment'
+ import { installWebPreloadApi } from './web-preload-api'
++import { probeWebDataPlugins } from './preload-api/host-capabilities/web-plugins-api'
+ import { initWebDeviceKeySupport } from './runtime/security/web-device-key-support'
+ import { WebPairingSecurityNotice } from './pairing/WebPairingSecurityNotice'
+ import { I18nProvider } from '../i18n/I18nProvider'
+@@ -79,7 +80,31 @@ function WebRoot(): React.JSX.Element {
+     )
+   }
+ 
+-  installWebPreloadApi()
++  return <PairedWebApp />
++}
++
++function PairedWebApp(): React.JSX.Element {
++  const [ready, setReady] = useState(false)
++  useEffect(() => {
++    installWebPreloadApi()
++    let mounted = true
++    void probeWebDataPlugins().finally(() => {
++      if (mounted) {
++        setReady(true)
++      }
++    })
++    const timer =
++      window.location.hostname === '127.0.0.1'
++        ? window.setInterval(() => void probeWebDataPlugins(), 30_000)
++        : undefined
++    return () => {
++      mounted = false
++      window.clearInterval(timer)
++    }
++  }, [])
++  if (!ready) {
++    return <div className="min-h-dvh bg-background" />
++  }
+   return (
+     <>
+       <Suspense fallback={<div className="min-h-dvh bg-background" />}>
+diff --git a/src/renderer/src/web/preload-api/host-capabilities/web-data-plugin-capability.ts b/src/renderer/src/web/preload-api/host-capabilities/web-data-plugin-capability.ts
+new file mode 100644
+index 00000000..adc47d79
+--- /dev/null
++++ b/src/renderer/src/web/preload-api/host-capabilities/web-data-plugin-capability.ts
+@@ -0,0 +1,12 @@
++import { useSyncExternalStore } from 'react'
++import { onWebDataPluginsChanged } from './web-plugins-api'
++import type { DataPluginMarketplaceApi } from '../../../../../preload/api/plugins/plugin-host-api'
++
++export function dataPluginMarketplace(): DataPluginMarketplaceApi | undefined {
++  const plugins = window.api?.plugins
++  return plugins?.dataMarketplace?.available === true ? plugins.dataMarketplace : undefined
++}
++
++export function useWebDataPluginsAvailable(): boolean {
++  return useSyncExternalStore(onWebDataPluginsChanged, () => dataPluginMarketplace() !== undefined)
++}
+diff --git a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts
+new file mode 100644
+index 00000000..df74b102
+--- /dev/null
++++ b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts
+@@ -0,0 +1,81 @@
++import { expect, it, vi } from 'vitest'
++import { createWebPluginsApi, probeWebDataPlugins } from './web-plugins-api'
++import { callRuntimeResult } from '../../runtime/client/web-runtime-calls'
++
++vi.mock('../../runtime/client/web-runtime-calls', () => ({ callRuntimeResult: vi.fn() }))
++vi.mock('../../runtime/client/web-runtime-session', () => ({
++  requireActiveEnvironmentOrNull: () => ({
++    endpoints: [{ endpoint: 'ws://127.0.0.1:54321' }]
++  })
++}))
++
++it('connects the official plugin page to the paired local host and forwards install approval', async () => {
++  vi.stubGlobal('window', {
++    location: { hostname: '127.0.0.1', protocol: 'http:', host: '127.0.0.1:54321' }
++  })
++  try {
++    const call = vi.mocked(callRuntimeResult)
++    call.mockImplementation(async (method) =>
++      method === 'dataPlugins.status'
++        ? { enabled: true, revision: 1, disabledPlugins: [], hostVersion: '1.4.265' }
++        : []
++    )
++    const api = createWebPluginsApi()
++    const onChange = vi.fn()
++    const unsubscribe = api.onChanged!(onChange)
++    expect(api.dataMarketplace?.available).toBe(false)
++    await probeWebDataPlugins()
++    expect(api.dataMarketplace?.available).toBe(true)
++    expect(api.dataMarketplace?.hostVersion).toBe('1.4.265')
++    expect(onChange).toHaveBeenCalledOnce()
++    unsubscribe()
++    await api.listMarketplaces!()
++    await api.listMarketplacePlugins!()
++    await api.refreshMarketplaces!()
++    expect(call.mock.calls.map(([method]) => method)).toEqual([
++      'dataPlugins.status',
++      'dataPlugins.sources',
++      'dataPlugins.listings',
++      'dataPlugins.refreshSources',
++      'dataPlugins.status'
++    ])
++
++    const review = {
++      marketplaceSourceId: 'official',
++      marketplaceCommit: 'a'.repeat(40),
++      pluginKey: 'publisher.theme',
++      resolvedCommit: 'b'.repeat(40),
++      enableIfData: true as const,
++      expectedFingerprint: 'reviewed'
++    }
++    await api.installMarketplacePlugin!(review)
++    expect(call).toHaveBeenCalledWith('dataPlugins.install', review, 260_000)
++
++    await api.invokeCommand!({ pluginKey: 'publisher.theme', commandId: 'ping' })
++    expect(call).toHaveBeenCalledWith(
++      'dataPlugins.invokeCommand',
++      { pluginKey: 'publisher.theme', commandId: 'ping' },
++      expect.any(Number)
++    )
++    await api.readPanelEntry!({ pluginKey: 'publisher.theme', panelId: 'hello' })
++    expect(call).toHaveBeenCalledWith(
++      'dataPlugins.readPanelEntry',
++      { pluginKey: 'publisher.theme', panelId: 'hello' },
++      expect.any(Number)
++    )
++    await api.readCustomEditorEntry!({ pluginKey: 'publisher.theme', editorId: 'hello' })
++    expect(call).toHaveBeenCalledWith(
++      'dataPlugins.readCustomEditorEntry',
++      { pluginKey: 'publisher.theme', editorId: 'hello' },
++      expect.any(Number)
++    )
++
++    const previousCalls = call.mock.calls.length
++    window.location.hostname = 'example.com'
++    expect(api.dataMarketplace?.available).toBe(false)
++    await expect(api.listMarketplacePlugins!()).rejects.toThrow('local Orca pairing')
++    expect(call.mock.calls).toHaveLength(previousCalls)
++  } finally {
++    vi.unstubAllGlobals()
++  }
++})
+diff --git a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts
+index 55d0b16c..91a3e5c9 100644
+--- a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts
++++ b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts
+@@ -1,14 +1,187 @@
+-import type { PluginsApi } from '../../../../../preload/api/plugins/plugin-host-api'
+-
+-/** Desktop-only: plugins run in the desktop app. Explicit because the fallback's `undefined`
+- *  crashes callers expecting lists and records. */
+-export function createWebPluginsApi(): Pick<
+-  PluginsApi,
+-  'getAutoUpdateState' | 'takeUpdateReviewNotices' | 'getInstallCounts'
+-> {
++import type {
++  DataPluginMarketplaceApi,
++  DataPluginStatus,
++  PluginsApi
++} from '../../../../../preload/api/plugins/plugin-host-api'
++import type { GlobalSettings } from '../../../../../shared/settings/global-settings-types'
++import type { PluginChangeEvent } from '../../../../../shared/plugins/events/plugin-change-event'
++import { callRuntimeResult } from '../../runtime/client/web-runtime-calls'
++import { requireActiveEnvironmentOrNull } from '../../runtime/client/web-runtime-session'
++
++const listeners = new Set<(event: PluginChangeEvent) => void>()
++let status: DataPluginStatus | null = null
++
++function hasLocalPairing(): boolean {
++  const { hostname, protocol, host } = window.location
++  const endpoints = requireActiveEnvironmentOrNull()?.endpoints
++  return (
++    hostname === '127.0.0.1' &&
++    protocol === 'http:' &&
++    !!endpoints?.length &&
++    endpoints.every(({ endpoint }) => endpoint === `ws://${host}` || endpoint === `ws://${host}/`)
++  )
++}
++
++async function call<T>(operation: string, params?: unknown, timeout = 10_000): Promise<T> {
++  if (!hasLocalPairing()) {
++    throw new Error('The local Orca pairing is unavailable.')
++  }
++  return callRuntimeResult<T>(`dataPlugins.${operation}`, params, timeout)
++}
++
++export function dataPluginSettings(): Partial<GlobalSettings> {
++  return status && hasLocalPairing()
++    ? {
++        pluginSystemEnabled: status.enabled,
++        disabledPlugins: status.disabledPlugins
++      }
++    : {}
++}
++
++export function onWebDataPluginsChanged(listener: (event: PluginChangeEvent) => void): () => void {
++  listeners.add(listener)
++  return () => listeners.delete(listener)
++}
++
++export function onDataPluginSettingsChanged(
++  listener: (updates: Partial<GlobalSettings>) => void
++): () => void {
++  return onWebDataPluginsChanged(() => listener(dataPluginSettings()))
++}
++
++function changed(): void {
++  for (const listener of listeners) {
++    listener({ contentPacksChanged: true })
++  }
++}
++
++export async function probeWebDataPlugins(timeout = 4_000): Promise<void> {
++  const next = hasLocalPairing()
++    ? await call<DataPluginStatus | null>('status', undefined, timeout).catch(() => null)
++    : null
++  const update = status?.revision !== next?.revision || status?.enabled !== next?.enabled
++  status = next
++  if (update) {
++    changed()
++  }
++}
++
++export function createWebPluginsApi(): Partial<PluginsApi> {
++  const check = () => status !== null && hasLocalPairing()
++  const read = <T>(operation: string): Promise<T[]> =>
++    check() ? call<T[]>(operation) : Promise.resolve([])
++  const mutate = async <T>(operation: string, params: unknown, timeout?: number): Promise<T> => {
++    const result = await call<T>(operation, params, timeout)
++    await probeWebDataPlugins()
++    return result
++  }
++  const marketplace: DataPluginMarketplaceApi = {
++    get hostVersion() {
++      return check() ? status?.hostVersion : undefined
++    },
++    get available() {
++      return check()
++    },
++    status: () => call('status'),
++    catalog: (refresh) => call('catalog', { refresh }, 140_000),
++    setSystemEnabled: (enabled) => mutate('setSystemEnabled', { enabled })
++  }
+   return {
++    dataMarketplace: marketplace,
++    list: () => read('list'),
++    invokeCommand: (args) => call('invokeCommand', args, 120_000),
++    readPanelEntry: ({ pluginKey, panelId }) => call('readPanelEntry', { pluginKey, panelId }),
++    readCustomEditorEntry: ({ pluginKey, editorId }) =>
++      call('readCustomEditorEntry', { pluginKey, editorId }),
++    panelAction: (args) => call('panelAction', args, 120_000),
++    install: (source) => mutate('installSource', source, 260_000),
++    resolveGitSource: (source) => call('resolveGitSource', source, 140_000),
++    subscribePanelPush: (sessionToken, listener) => {
++      if (!check()) {
++        return () => {}
++      }
++      const subscriptionId = crypto.randomUUID()
++      let closed = false
++      const subscription = window.api.runtime.subscribe(
++        { method: 'dataPlugins.panelPush', params: { subscriptionId, sessionToken } },
++        (response) => {
++          if (
++            !closed &&
++            response.ok &&
++            typeof response.result === 'object' &&
++            response.result &&
++            'push' in response.result
++          ) {
++            listener(response.result.push)
++          }
++        }
++      )
++      void subscription.catch(() => undefined)
++      return () => {
++        closed = true
++        void subscription
++          .then(async (handle) => {
++            try {
++              await call('closePanelPush', { subscriptionId })
++            } finally {
++              handle.unsubscribe()
++            }
++          })
++          .catch(() => undefined)
++      }
++    },
++    refresh: () => mutate('refresh', undefined),
++    listMarketplaces: () => call('sources', undefined, 140_000),
++    listMarketplacePlugins: () => call('listings', undefined, 140_000),
++    refreshMarketplaces: () => mutate('refreshSources', undefined, 140_000),
++    getSettings: (args) => call('getSettings', args),
++    setSetting: (args) => mutate('setSetting', args),
++    getInstalledManifest: (args) => call('manifest', args),
++    getLogs: (args) => call('logs', args),
++    consent: (args) => mutate('consent', args),
++    previewMarketplaceUpdate: (args) => call('previewUpdate', args, 140_000),
++    getRollbackVersion: (args) => call('rollbackVersion', args),
++    rollbackMarketplacePlugin: (args) => mutate('rollback', args, 260_000),
++    onInstallCountsChanged: () => () => {},
++    onAutoUpdateChanged: () => () => {},
++    listThemes: () => read('themes'),
++    listTerminalThemes: () => read('terminalThemes'),
++    listIconThemes: () => read('iconThemes'),
++    loadIconTheme: (id) => (check() ? call('loadIconTheme', { id }) : Promise.resolve(null)),
++    listSyntaxes: () => read('syntaxes'),
++    loadSyntax: (id) => (check() ? call('loadSyntax', { id }) : Promise.resolve(null)),
++    listLanguagePacks: () => read('languagePacks'),
++    readNewFileTemplate: (args) =>
++      check() ? call('newFileTemplate', args) : Promise.resolve(null),
++    previewMarketplacePlugin: (args) => call('preview', args, 140_000),
++    installMarketplacePlugin: (args) => {
++      const {
++        marketplaceSourceId,
++        marketplaceCommit,
++        pluginKey,
++        resolvedCommit,
++        contentHash,
++        enableIfData,
++        expectedFingerprint
++      } = args
++      return mutate(
++        'install',
++        {
++          marketplaceSourceId,
++          marketplaceCommit,
++          pluginKey,
++          resolvedCommit,
++          contentHash,
++          enableIfData,
++          expectedFingerprint
++        },
++        260_000
++      )
++    },
++    setEnabled: (args) => mutate('setEnabled', args),
++    remove: (args) => mutate('remove', args),
++    onChanged: onWebDataPluginsChanged,
+     getAutoUpdateState: () => Promise.resolve({ updated: {}, needsReview: {} }),
+-    // Why empty: taking marks the host's notices told, which would hide them from its desktop app.
+     takeUpdateReviewNotices: () => Promise.resolve([]),
+     getInstallCounts: () => Promise.resolve({})
+   }
+diff --git a/src/renderer/src/web/preload-api/preferences/web-settings-api.ts b/src/renderer/src/web/preload-api/preferences/web-settings-api.ts
+index 1e6171d1..75320660 100644
+--- a/src/renderer/src/web/preload-api/preferences/web-settings-api.ts
++++ b/src/renderer/src/web/preload-api/preferences/web-settings-api.ts
+@@ -22,16 +22,30 @@ import {
+   webRuntimeState
+ } from '../../runtime/client/web-runtime-session'
+ import { noopUnsubscribe } from '../web-storage'
++import { dataPluginMarketplace } from '../host-capabilities/web-data-plugin-capability'
++import {
++  dataPluginSettings,
++  onDataPluginSettingsChanged
++} from '../host-capabilities/web-plugins-api'
+ 
+ export function createWebSettingsApi(): Pick<Partial<PreloadApi>, 'agentAwake'> & {
+   settings: Partial<WebSettingsApi>
+ } {
+   return {
+     settings: {
+-      get: async () => getRuntimeBackedStoredSettings(),
++      get: async () => ({
++        ...(await getRuntimeBackedStoredSettings()),
++        ...dataPluginSettings()
++      }),
+       // Why: localStorage-backed settings are synchronous, so the pre-hydration kill-switch read works the same as desktop.
+-      getSync: () => settingsForActiveVisibilityOwner(getStoredSettings()),
++      getSync: () => ({
++        ...settingsForActiveVisibilityOwner(getStoredSettings()),
++        ...dataPluginSettings()
++      }),
+       set: async (updates) => {
++        if (updates.pluginSystemEnabled !== undefined) {
++          await dataPluginMarketplace()?.setSystemEnabled(updates.pluginSystemEnabled)
++        }
+         const sanitizedUpdates = stripRetiredWebChatSettings(updates)
+         const runtimeEnvironment = requireActiveEnvironmentOrNull()
+         delete sanitizedUpdates.activeRuntimeEnvironmentId
+@@ -89,7 +103,10 @@ export function createWebSettingsApi(): Pick<Partial<PreloadApi>, 'agentAwake'>
+           preserveAutoRenameBranchFromWorkUpdate: 'autoRenameBranchFromWork' in sanitizedUpdates
+         })
+         writeStoredSettings(next)
+-        return settingsForActiveVisibilityOwner(await syncRuntimeBackedSettings(sanitizedUpdates))
++        return {
++          ...settingsForActiveVisibilityOwner(await syncRuntimeBackedSettings(sanitizedUpdates)),
++          ...dataPluginSettings()
++        }
+       },
+       setActiveRuntimeEnvironmentPreference: async ({ environmentId }) => {
+         const requestedEnvironmentId = environmentId?.trim() || null
+@@ -104,7 +121,7 @@ export function createWebSettingsApi(): Pick<Partial<PreloadApi>, 'agentAwake'>
+       },
+       updatePRBotAuthorOverride: (args) => updateRuntimePRBotAuthorOverride(args),
+       listFonts: () => Promise.resolve([]),
+-      onChanged: () => noopUnsubscribe
++      onChanged: onDataPluginSettingsChanged
+     },
+     agentAwake: {
+       getStatus: async () => {
+diff --git a/src/renderer/src/web/runtime/client/web-runtime-client.ts b/src/renderer/src/web/runtime/client/web-runtime-client.ts
+index b16d59fc..63ee8bb9 100644
+--- a/src/renderer/src/web/runtime/client/web-runtime-client.ts
++++ b/src/renderer/src/web/runtime/client/web-runtime-client.ts
+@@ -126,6 +126,10 @@ export class WebRuntimeClient {
+   ): Promise<WebRuntimeTransportSubscriptionHandle> {
+     try {
+       throwIfSignalAborted(options?.signal)
++      // Panel sessions are owned by the socket that opened the frame.
++      if (method === 'dataPlugins.panelPush') {
++        return this.subscribeOnCurrentConnection(method, params, callbacks, options)
++      }
+       return SHARED_CONNECTION_SUBSCRIPTION_METHODS.has(method)
+         ? this.subscribeFileWatch(params, callbacks, options)
+         : this.subscribeDedicated(method, params, callbacks, options)
+diff --git a/src/shared/rpc-contract/plugins/data-plugin-params.ts b/src/shared/rpc-contract/plugins/data-plugin-params.ts
+new file mode 100644
+index 00000000..5fc6e283
+--- /dev/null
++++ b/src/shared/rpc-contract/plugins/data-plugin-params.ts
+@@ -0,0 +1,73 @@
++import { panelSessionTokenSchema } from '../../plugins/frames/plugin-frame-bridge'
++import { z } from 'zod'
++import { PluginInvokeCommandParams } from './plugins-params'
++
++import {
++  PLUGIN_COMMIT_PATTERN,
++  PLUGIN_CONTENT_HASH_PATTERN
++} from '../../plugins/installation/plugin-install-lockfile'
++import { isQualifiedPluginKey } from '../../plugins/frames/plugin-tab-key'
++
++const key = z.string().max(256).refine(isQualifiedPluginKey)
++export const DataPluginKeyParams = z.strictObject({ pluginKey: key })
++export const DataPluginPreviewParams = DataPluginKeyParams.extend({
++  marketplaceSourceId: z.string().min(1).max(128)
++})
++export const DataPluginInstallParams = DataPluginPreviewParams.extend({
++  marketplaceCommit: z.string().regex(PLUGIN_COMMIT_PATTERN),
++  resolvedCommit: z.string().regex(PLUGIN_COMMIT_PATTERN),
++  contentHash: z.string().regex(PLUGIN_CONTENT_HASH_PATTERN).optional(),
++  enableIfData: z.literal(true).optional(),
++  expectedFingerprint: z.string().min(1).max(256).optional()
++})
++export const DataPluginArtifactParams = z.strictObject({
++  id: z.string().min(1).max(512)
++})
++
++export const DataPluginSystemParams = z.strictObject({ enabled: z.boolean() })
++export const DataPluginCatalogParams = z.strictObject({ refresh: z.boolean() })
++export const DataPluginConsentParams = DataPluginKeyParams.extend({
++  reviewedFingerprint: z.string().min(1).max(256),
++  decision: z.enum(['approve', 'keep-disabled'])
++})
++export const DataPluginEnablementParams = DataPluginKeyParams.extend({
++  enabled: z.boolean(),
++  reviewedFingerprint: z.string().min(1).max(256).optional()
++})
++export const DataPluginNewFileParams = DataPluginKeyParams.extend({
++  newFileId: z.string().min(1).max(256)
++})
++
++export const DataPluginEditorParams = DataPluginKeyParams.extend({
++  editorId: z.string().min(1).max(128)
++})
++export const DataPluginInvokeParams = PluginInvokeCommandParams.extend({
++  timeoutMs: z.number().int().positive().max(120_000).optional()
++})
++
++export const DataPluginResolveGitParams = z.strictObject({
++  url: z.string().trim().min(1).max(4096),
++  ref: z.string().trim().max(4096)
++})
++export const DataPluginInstallSourceParams = z.discriminatedUnion('kind', [
++  z.strictObject({
++    kind: z.literal('local-path'),
++    path: z
++      .string()
++      .min(1)
++      .max(32 * 1024)
++  }),
++  DataPluginResolveGitParams.extend({
++    kind: z.literal('git'),
++    expectedCommit: z.string().regex(PLUGIN_COMMIT_PATTERN)
++  })
++])
++export const DataPluginPushCloseParams = z.strictObject({ subscriptionId: z.uuid() })
++export const DataPluginPushParams = DataPluginPushCloseParams.extend({
++  sessionToken: panelSessionTokenSchema
++})
++
++export const DataPluginSettingParams = DataPluginKeyParams.extend({
++  key: z.string().min(1).max(64),
++  value: z.json()
++})
+diff --git a/src/shared/rpc-contract/rpc-params-catalog.generated.ts b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+index 2135e765..baf4f5ae 100644
+--- a/src/shared/rpc-contract/rpc-params-catalog.generated.ts
++++ b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+@@ -682,6 +682,24 @@ import {
+ } from './orchestration/orchestration-worker-release-schemas-params'
+ import { WorkerStartParams } from './orchestration/orchestration-worker-start-params'
+ import { WorkerDispatchParams as WorkerDispatchParamsOfOrchestrationWorkerStopParams } from './orchestration/orchestration-worker-stop-params'
++import {
++  DataPluginArtifactParams,
++  DataPluginCatalogParams,
++  DataPluginConsentParams,
++  DataPluginEditorParams,
++  DataPluginEnablementParams,
++  DataPluginInstallParams,
++  DataPluginInstallSourceParams,
++  DataPluginInvokeParams,
++  DataPluginKeyParams,
++  DataPluginNewFileParams,
++  DataPluginPreviewParams,
++  DataPluginPushCloseParams,
++  DataPluginPushParams,
++  DataPluginResolveGitParams,
++  DataPluginSettingParams,
++  DataPluginSystemParams
++} from './plugins/data-plugin-params'
+ import {
+   PluginCatalogAddParams,
+   PluginCatalogRemoveParams,
+@@ -1438,6 +1456,42 @@ export const RPC_PARAMS_BY_METHOD = {
+   'connector.slackMirror.post': ConnectorSlackMirrorPost,
+   'connector.slackMirror.set': ConnectorSlackMirrorSet,
+   'connector.slackMirror.status': ConnectorSlackMirrorStatus,
++  'dataPlugins.catalog': DataPluginCatalogParams,
++  'dataPlugins.closePanelPush': DataPluginPushCloseParams,
++  'dataPlugins.consent': DataPluginConsentParams,
++  'dataPlugins.getSettings': DataPluginKeyParams,
++  'dataPlugins.iconThemes': null,
++  'dataPlugins.install': DataPluginInstallParams,
++  'dataPlugins.installSource': DataPluginInstallSourceParams,
++  'dataPlugins.invokeCommand': DataPluginInvokeParams,
++  'dataPlugins.languagePacks': null,
++  'dataPlugins.list': null,
++  'dataPlugins.listings': null,
++  'dataPlugins.loadIconTheme': DataPluginArtifactParams,
++  'dataPlugins.loadSyntax': DataPluginArtifactParams,
++  'dataPlugins.logs': DataPluginKeyParams,
++  'dataPlugins.manifest': DataPluginKeyParams,
++  'dataPlugins.newFileTemplate': DataPluginNewFileParams,
++  'dataPlugins.panelAction': PluginsPanelActionParams,
++  'dataPlugins.panelPush': DataPluginPushParams,
++  'dataPlugins.preview': DataPluginPreviewParams,
++  'dataPlugins.previewUpdate': DataPluginKeyParams,
++  'dataPlugins.readCustomEditorEntry': DataPluginEditorParams,
++  'dataPlugins.readPanelEntry': PluginReadPanelEntryParams,
++  'dataPlugins.refresh': null,
++  'dataPlugins.refreshSources': null,
++  'dataPlugins.remove': DataPluginKeyParams,
++  'dataPlugins.resolveGitSource': DataPluginResolveGitParams,
++  'dataPlugins.rollback': DataPluginKeyParams,
++  'dataPlugins.rollbackVersion': DataPluginKeyParams,
++  'dataPlugins.setEnabled': DataPluginEnablementParams,
++  'dataPlugins.setSetting': DataPluginSettingParams,
++  'dataPlugins.setSystemEnabled': DataPluginSystemParams,
++  'dataPlugins.sources': null,
++  'dataPlugins.status': null,
++  'dataPlugins.syntaxes': null,
++  'dataPlugins.terminalThemes': null,
++  'dataPlugins.themes': null,
+   'desktop.openWindowInBackground': null,
+   'desktopBrowserBridge.attach': DesktopBrowserBridgeAttachParams,
+   'desktopBrowserBridge.result': DesktopBrowserBridgeResultParams,

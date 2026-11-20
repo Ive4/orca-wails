@@ -1,0 +1,14 @@
+{
+  "port": 16768,
+  "core_directory": null,
+  "update_repository": null,
+  "download_proxy": null,
+  "start_core_on_launch": true,
+  "open_window_on_start": true,
+  "autostart": false,
+  "global_shortcut": "CommandOrControl+Shift+O",
+  "notifications": true,
+  "environment": {},
+  "startup_timeout_secs": 60,
+  "shutdown_timeout_secs": 8
+}

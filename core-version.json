@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "version": "v1.4.266",
+  "package_revision": "0.0.1",
+  "target": "x86_64-pc-windows-msvc",
+  "upstream_target": "win32-x64",
+  "validation": {
+    "status": "archive-verified-awaiting-windows-smoke",
+    "audited_on": "2026-11-20",
+    "note": "Official installer bytes, NSIS layout, 433 slot file hashes and 1513 browser assets were checked without executing the core. Windows runtime, PTY, Job and WebView qualification must still pass in CI/on Windows 11."
+  },
+  "upstream": {
+    "repository": "stablyai/orca",
+    "commit": "903c91e80fbe7bbcaffe6ac767c49eac91e98a64",
+    "asset": "orca-windows-setup.exe",
+    "sha256": "a5e2f21f3e839900624a828c53c3783d5c8d2ccf90ef94f404021d3951e57e18"
+  },
+  "node": {
+    "version": "24.22.1",
+    "archive": "node-v24.22.1-win-x64.zip",
+    "archive_sha256": "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5",
+    "executable_sha256": "d702daa815eabbff763c7d3808e235cf031cf2ca70211b56847bc72f51e240e5"
+  },
+  "source_sha256": {
+    "src/shared/remote-runtime/orcad-distribution/orcad-artifacts.ts": "af5a5cf2e4bb11c8c06eb4ba8bc2f0e78260c589446c7e646a4572c6933b9772",
+    "src/shared/node-runtime/node-runtime-pin.ts": "d752788ccf8839032b0910ffa30c7ca9c1125230824945db3d7bc0b65738484a",
+    "LICENSE": "ff1b611f80580d49f4b97e93a97b24eb050b0671b26b8afe16341fab699112f3"
+  }
+}
