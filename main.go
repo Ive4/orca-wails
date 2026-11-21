@@ -49,23 +49,29 @@ type desktop struct {
 	seed   string
 	launch launchOptions
 
-	operation sync.Mutex
-	busy      atomic.Bool
-	pending   atomic.Bool
-	quitting  atomic.Bool
-	quitReady atomic.Bool
+	operation  sync.Mutex
+	busy       atomic.Bool
+	pending    atomic.Pointer[desktopRequest]
+	quitting   atomic.Bool
+	quitReady  atomic.Bool
+	settingsMu sync.Mutex
 
-	statusMu         sync.RWMutex
-	message          string
-	latestOfficial   string
-	pendingApp       string
-	appUpdateEnabled bool
-	coreUpdate       *update.Release
-	taskPID          int
-	taskSummary      *tasks.Summary
-	taskAttempted    bool
-	retryTasks       chan struct{}
-	autostart        bool
+	statusMu          sync.RWMutex
+	message           string
+	latestOfficial    string
+	pendingApp        string
+	appUpdateEnabled  bool
+	coreUpdate        *update.Release
+	taskPID           int
+	taskSummary       *tasks.Summary
+	taskAttempted     bool
+	retryTasks        chan struct{}
+	autostart         bool
+	notifications     bool
+	entries           macOSEntries
+	nativeTray        bool
+	nativeTrayMu      sync.Mutex
+	nativeTrayDetails *trayVersions
 
 	window           atomic.Pointer[orcaWindow]
 	panel            atomic.Pointer[trayPanel]
@@ -170,12 +176,17 @@ func run(opts launchOptions) error {
 		return err
 	}
 	d.autostart = autostartEnabled()
+	d.notifications = d.cfg.Notifications
+	d.entries = d.cfg.MacOSEntries
 	if err := d.configureAppUpdater(); err != nil {
 		return err
 	}
 	d.store = update.Store{Root: d.paths.core, Repository: d.cfg.UpdateRepository,
 		Proxy: d.cfg.DownloadProxy, Target: targetTriple()}
-	d.configureTray()
+	d.nativeTray = d.startNativeTray()
+	if !d.nativeTray {
+		d.configureTray()
+	}
 	d.app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(_ *application.ApplicationEvent) {
 		go d.start(opts.Background)
 	})
@@ -189,6 +200,7 @@ func run(opts launchOptions) error {
 }
 
 func (d *desktop) start(background bool) {
+	d.refreshNativeTray(true)
 	shortcut := strings.ReplaceAll(strings.ToLower(d.cfg.GlobalShortcut), "commandorcontrol", "cmdorctrl")
 	if err := d.app.GlobalShortcut.Register(shortcut, func() { d.request("toggle", nil) }); err != nil {
 		d.setMessage("全局快捷键不可用：" + err.Error())

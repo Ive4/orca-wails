@@ -28,7 +28,7 @@ function pairingUrl(value = offer) {
   const code = Buffer.from(JSON.stringify(value)).toString('base64url');
   return `http://127.0.0.1:6768/web-index.html#pairing=${encodeURIComponent(`orca://pair?code=${code}`)}`;
 }
-function run({ value = offer, saved = environment(), url = pairingUrl(value), storageError = false, frame = false } = {}) {
+function start({ value = offer, saved = environment(), url = pairingUrl(value), storageError = false, frame = false } = {}) {
   const raw = typeof saved === 'string' ? saved : saved === null ? null : JSON.stringify(saved);
   const updates = [];
   const location = new URL(url);
@@ -50,11 +50,13 @@ function run({ value = offer, saved = environment(), url = pairingUrl(value), st
   } };
   window.self = window;
   window.top = frame ? {} : window;
-  const context = vm.createContext({ window, URL, URLSearchParams, TextDecoder, Uint8Array,
+  const nativeFragment = new URL(pairingUrl(value)).hash.slice(1);
+  const context = vm.createContext({ window, URL, URLSearchParams, TextDecoder, Uint8Array, nativeFragment,
     atob, console: { log() { assert.fail('No credential logging.'); }, warn() { assert.fail('No credential logging.'); }, error() { assert.fail('No credential logging.'); } } });
-  vm.runInContext(source, context, { timeout: 1000 });
-  return updates;
+  vm.runInContext(source + '(nativeFragment);', context, { timeout: 1000 });
+  return { updates, window };
 }
+const run = (options) => start(options).updates;
 const clean = ['http://127.0.0.1:6768/web-index.html'];
 
 test('first window closed before upstream saves pairing keeps its offer on reopen', () => {
@@ -75,6 +77,23 @@ test('cleared profile retains the offer even if earlier windows succeeded', () =
 });
 test('same port with a different host key never suppresses pairing', () => {
   assert.deepEqual(run({ value: { ...offer, publicKeyB64: secondKey } }), []);
+});
+test('the first local window and reload recognize only the Core from the native offer', () => {
+  for (const url of [pairingUrl(), clean[0]]) {
+    const { window } = start({ url, saved: null });
+    assert.equal(window.__orcaWailsOwnsRuntime(environment({ sessionOnly: true })), true);
+    assert.equal(window.__orcaWailsOwnsRuntime(environment({
+      endpoints: [{ ...environment().endpoints[0], publicKeyB64: secondKey }],
+    })), false);
+    assert.equal(window.__orcaWailsOwnsRuntime(environment({
+      endpoints: [{ ...environment().endpoints[0], endpoint: 'ws://127.0.0.1:6769' }],
+    })), false);
+    assert.equal(window.__orcaWailsOwnsRuntime(environment({
+      hostDescriptor: { installationId: '22222222-2222-4222-8222-222222222222' },
+    })), false);
+  }
+  assert.equal(start({ url: pairingUrl().replace('127.0.0.1', 'localhost') }).window.__orcaWailsOwnsRuntime, undefined);
+  assert.equal(start({ frame: true }).window.__orcaWailsOwnsRuntime, undefined);
 });
 test('same key with a different installation is a different host', () => {
   assert.deepEqual(run({ value: { ...offer, hostDescriptor: { ...host, installationId: '22222222-2222-4222-8222-222222222222' } } }), []);

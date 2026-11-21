@@ -3,36 +3,41 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Orca 任务</title>
+  <title>Orca 托盘</title>
   <link rel="stylesheet" href="panel.css">
   <script defer src="panel.js"></script>
 </head>
 <body>
-<main id="panel" class="popup" aria-label="Orca 任务">
-  <section id="tasks" class="page">
-    <nav class="tabs" aria-label="任务列表">
-      <button class="tab" id="active" aria-current="true">进行中<span id="count"></span></button>
-      <button class="tab" id="recent" aria-current="false">最近结束</button>
-    </nav>
+<main id="panel" class="popup" aria-label="Orca 托盘">
+  <section id="tasks" class="page" aria-label="任务">
+    <header class="task-header">
+      <nav class="tabs" aria-label="任务列表">
+        <button class="tab" id="active" type="button" aria-current="true" aria-controls="list">当前</button>
+        <button class="tab" id="recent" type="button" aria-current="false" aria-controls="list">最近</button>
+      </nav>
+      <div class="toolbar-actions" role="group" aria-label="快捷操作">
+        <button class="control toolbar-button" id="bots" type="button" aria-label="机器人" title="机器人" disabled>
+          <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="8" width="14" height="12" rx="3"/><path d="M12 8V4m-9 9v2m18-2v2m-12-2v2m6-2v2"/></svg>
+        </button>
+        <button class="control toolbar-button" id="open" type="button" aria-label="打开 Orca" title="打开 Orca" disabled>
+          <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6M14 4h6v6m0-6-9 9"/></svg>
+        </button>
+        <button class="control toolbar-button" id="settings-button" type="button" aria-label="设置" title="设置" aria-controls="preferences">
+          <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>
+        </button>
+      </div>
+    </header>
     <div class="list" id="list" aria-label="任务状态">
       <div class="empty">正在读取任务…</div>
     </div>
     <div class="notice" id="task-message" role="status" hidden></div>
-    <footer class="foot">
-      <button class="control" id="settings-button">
-        <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>设置
-      </button>
-      <button class="control open" id="open">
-        打开 Orca <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 16l8-8m-6 0h6v6"/></svg>
-      </button>
-    </footer>
   </section>
-  <section id="preferences" class="page" hidden>
+  <section id="preferences" class="page" aria-labelledby="page-title" hidden>
     <header class="settings-head">
-      <button class="control" id="back" aria-label="返回">
+      <button class="control back" id="back" type="button" aria-label="返回">
         <svg class="symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
       </button>
-      <h2 id="page-title">设置</h2>
+      <h1 id="page-title">设置</h1>
     </header>
     <div class="settings-body" id="settings-content"></div>
     <div class="notice" id="settings-message" role="status" hidden></div>

@@ -30,9 +30,15 @@ type config struct {
 	Autostart           bool              `json:"autostart"`
 	GlobalShortcut      string            `json:"global_shortcut"`
 	Notifications       bool              `json:"notifications"`
+	MacOSEntries        macOSEntries      `json:"macos_entries"`
 	Environment         map[string]string `json:"environment"`
 	StartupTimeoutSecs  int               `json:"startup_timeout_secs"`
 	ShutdownTimeoutSecs int               `json:"shutdown_timeout_secs"`
+}
+
+type macOSEntries struct {
+	MenuBar bool `json:"menu_bar"`
+	Notch   bool `json:"notch"`
 }
 
 type paths struct {
@@ -43,7 +49,8 @@ func loadConfig(root string) (config, paths, error) {
 	cfg := config{
 		Port: 6768, StartCoreOnLaunch: true, OpenWindowOnStart: true,
 		GlobalShortcut: "CommandOrControl+Shift+O", Notifications: true,
-		Environment: map[string]string{}, StartupTimeoutSecs: 60, ShutdownTimeoutSecs: 8,
+		MacOSEntries: macOSEntries{MenuBar: true},
+		Environment:  map[string]string{}, StartupTimeoutSecs: 60, ShutdownTimeoutSecs: 8,
 	}
 	if runtime.GOOS == "darwin" {
 		cfg.Port = 16768

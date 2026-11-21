@@ -28,3 +28,38 @@ func TestExpandDoesNotInterpretBracesInInsertedPaths(t *testing.T) {
 		t.Fatalf("unexpected expansion %q (%v)", got, err)
 	}
 }
+
+func TestMacOSEntryPreferencesAreIndependentAndPersisted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"notifications":false}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, paths, err := loadConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MacOSEntries.MenuBar || cfg.MacOSEntries.Notch {
+		t.Fatalf("legacy defaults: %+v", cfg.MacOSEntries)
+	}
+	d := desktop{paths: paths, entries: cfg.MacOSEntries}
+	for _, step := range []struct {
+		action string
+		want   macOSEntries
+	}{
+		{"notch_on", macOSEntries{MenuBar: true, Notch: true}},
+		{"menu_bar_off", macOSEntries{MenuBar: false, Notch: true}},
+		{"notch_off", macOSEntries{MenuBar: false, Notch: false}},
+		{"menu_bar_on", macOSEntries{MenuBar: true, Notch: false}},
+	} {
+		if err := d.setMacOSEntry(step.action); err != nil {
+			t.Fatalf("%s: %v", step.action, err)
+		}
+		saved, _, err := loadConfig(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if saved.MacOSEntries != step.want || d.entries != step.want || saved.Notifications {
+			t.Fatalf("%s: saved %+v, active %+v, want %+v", step.action, saved.MacOSEntries, d.entries, step.want)
+		}
+	}
+}

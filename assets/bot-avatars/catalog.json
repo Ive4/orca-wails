@@ -1,0 +1,77 @@
+[
+  {
+    "en": "Jujutsu Kaisen",
+    "zh": "咒术回战",
+    "avatars": [
+      {"file": "jujutsu-kaisen/01-gojo-satoru.webp", "en": "Satoru Gojo", "zh": "五条悟", "slot": "A1"},
+      {"file": "jujutsu-kaisen/02-itadori-yuji.webp", "en": "Yuji Itadori", "zh": "虎杖悠仁", "slot": "B1"},
+      {"file": "jujutsu-kaisen/03-fushiguro-megumi.webp", "en": "Megumi Fushiguro", "zh": "伏黑惠", "slot": "D1"},
+      {"file": "jujutsu-kaisen/04-kugisaki-nobara.webp", "en": "Nobara Kugisaki", "zh": "钉崎野蔷薇"},
+      {"file": "jujutsu-kaisen/05-ryomen-sukuna.webp", "en": "Ryomen Sukuna", "zh": "两面宿傩", "slot": "E1"},
+      {"file": "jujutsu-kaisen/06-nanami-kento.webp", "en": "Kento Nanami", "zh": "七海建人"},
+      {"file": "jujutsu-kaisen/07-geto-suguru.webp", "en": "Suguru Geto", "zh": "夏油杰"},
+      {"file": "jujutsu-kaisen/08-inumaki-toge.webp", "en": "Toge Inumaki", "zh": "狗卷棘"},
+      {"file": "jujutsu-kaisen/09-fushiguro-toji.webp", "en": "Toji Fushiguro", "zh": "伏黑甚尔"}
+    ]
+  },
+  {
+    "en": "One Piece",
+    "zh": "海贼王",
+    "avatars": [
+      {"file": "one-piece/01-luffy.webp", "en": "Monkey D. Luffy", "zh": "路飞", "slot": "F1"},
+      {"file": "one-piece/02-zoro.webp", "en": "Roronoa Zoro", "zh": "索隆", "slot": "G1"},
+      {"file": "one-piece/03-nami.webp", "en": "Nami", "zh": "娜美", "slot": "H1"},
+      {"file": "one-piece/04-sanji.webp", "en": "Sanji", "zh": "山治"},
+      {"file": "one-piece/05-chopper.webp", "en": "Tony Tony Chopper", "zh": "乔巴", "slot": "H2"},
+      {"file": "one-piece/06-robin.webp", "en": "Nico Robin", "zh": "罗宾"},
+      {"file": "one-piece/07-ace.webp", "en": "Portgas D. Ace", "zh": "艾斯"},
+      {"file": "one-piece/08-law.webp", "en": "Trafalgar Law", "zh": "特拉法尔加·罗"},
+      {"file": "one-piece/09-shanks.webp", "en": "Shanks", "zh": "香克斯"}
+    ]
+  },
+  {
+    "en": "Naruto",
+    "zh": "火影忍者",
+    "avatars": [
+      {"file": "naruto/01-naruto.webp", "en": "Naruto Uzumaki", "zh": "漩涡鸣人", "slot": "I1"},
+      {"file": "naruto/02-sasuke.webp", "en": "Sasuke Uchiha", "zh": "宇智波佐助", "slot": "J1"},
+      {"file": "naruto/03-sakura.webp", "en": "Sakura Haruno", "zh": "春野樱", "slot": "K2"},
+      {"file": "naruto/04-kakashi.webp", "en": "Kakashi Hatake", "zh": "旗木卡卡西", "slot": "L2"},
+      {"file": "naruto/05-gaara.webp", "en": "Gaara", "zh": "我爱罗"},
+      {"file": "naruto/06-hinata.webp", "en": "Hinata Hyuga", "zh": "日向雏田"},
+      {"file": "naruto/07-itachi.webp", "en": "Itachi Uchiha", "zh": "宇智波鼬"},
+      {"file": "naruto/08-jiraiya.webp", "en": "Jiraiya", "zh": "自来也"},
+      {"file": "naruto/09-tsunade.webp", "en": "Tsunade", "zh": "纲手"}
+    ]
+  },
+  {
+    "en": "Akatsuki",
+    "zh": "晓组织",
+    "avatars": [
+      {"file": "akatsuki/01-pain.webp", "en": "Pain (Deva Path)", "zh": "佩恩（天道）", "slot": "M1"},
+      {"file": "akatsuki/02-konan.webp", "en": "Konan", "zh": "小南", "slot": "N1"},
+      {"file": "akatsuki/03-tobi.webp", "en": "Tobi", "zh": "阿飞", "slot": "O1"},
+      {"file": "akatsuki/04-itachi.webp", "en": "Itachi Uchiha", "zh": "宇智波鼬"},
+      {"file": "akatsuki/05-kisame.webp", "en": "Kisame Hoshigaki", "zh": "干柿鬼鲛"},
+      {"file": "akatsuki/06-zetsu.webp", "en": "Zetsu", "zh": "黑白绝"},
+      {"file": "akatsuki/07-deidara.webp", "en": "Deidara", "zh": "迪达拉"},
+      {"file": "akatsuki/08-sasori.webp", "en": "Sasori", "zh": "蝎"},
+      {"file": "akatsuki/09-orochimaru.webp", "en": "Orochimaru", "zh": "大蛇丸", "slot": "P3"}
+    ]
+  },
+  {
+    "en": "Tailed beasts",
+    "zh": "九大尾兽",
+    "avatars": [
+      {"file": "tailed-beasts/01-shukaku.webp", "en": "Shukaku · One-Tail", "zh": "一尾守鹤", "slot": "Q1"},
+      {"file": "tailed-beasts/02-matatabi.webp", "en": "Matatabi · Two-Tails", "zh": "二尾又旅", "slot": "R3"},
+      {"file": "tailed-beasts/03-isobu.webp", "en": "Isobu · Three-Tails", "zh": "三尾矶抚"},
+      {"file": "tailed-beasts/04-son-goku.webp", "en": "Son Goku · Four-Tails", "zh": "四尾孙悟空"},
+      {"file": "tailed-beasts/05-kokuo.webp", "en": "Kokuō · Five-Tails", "zh": "五尾穆王"},
+      {"file": "tailed-beasts/06-saiken.webp", "en": "Saiken · Six-Tails", "zh": "六尾犀犬"},
+      {"file": "tailed-beasts/07-chomei.webp", "en": "Chōmei · Seven-Tails", "zh": "七尾重明"},
+      {"file": "tailed-beasts/08-gyuki.webp", "en": "Gyūki · Eight-Tails", "zh": "八尾牛鬼", "slot": "S2"},
+      {"file": "tailed-beasts/09-kurama.webp", "en": "Kurama · Nine-Tails", "zh": "九尾九喇嘛", "slot": "T1"}
+    ]
+  }
+]

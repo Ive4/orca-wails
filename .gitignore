@@ -1,3 +1,4 @@
 .DS_Store
 /bin/
 /dist-core/
+/scripts/__pycache__/

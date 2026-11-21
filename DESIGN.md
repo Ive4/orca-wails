@@ -1,0 +1,23 @@
+# Orca-Wails tray
+
+The tray opens on tasks. The first screen shows which sessions need attention and lets users open one with a click. On macOS, the header pairs Current and Recent with icon shortcuts for New Bot Conversation and Open Window. New conversations start with the local Bot picker, then focus the selected Bot’s new chat. More contains Bots and Settings. Each shortcut has a tooltip and an accessibility label. The task list scrolls below it.
+
+The macOS application menu contains Workspace, Sessions, Window and Help commands. Sessions uses the same task snapshot and opens the original session. The application's settings and maintenance commands open a native window that also works when Orca's main window is closed. See [the integrated menu bar design](docs/design/macos-menu-bar-workbench.md) for command placement.
+
+## Appearance
+
+The panel is 336 points wide. Its tip sits four points below the menu bar, centered on the cat mark whenever the display has room. At the edge, the panel moves inward and the tip follows the mark within the rounded corners. It uses the system typeface and the system light or dark appearance. A subtle fill marks the selected tab. Amber and red identify tasks waiting for input and tasks that are blocked. Their text labels explain each state.
+
+The Notch panel sits flush with the top edge on built-in displays with a camera cutout. Its compact height matches the physical cutout. The cat sits immediately to the left and gives access at idle. A number at the right shows pending tasks as the first priority and running or monitoring tasks otherwise. The same window expands around the cutout to show All, Current, and Recent. The expanded body is 386 points wide with 7-point shoulders at the screen edge. The toolbar and rows share 14-point side insets. Standard rows are 50 points high, with a 7-point gap between their status mark and title. All is selected on entry and includes current tasks and the last 24 hours of completions. Hover opens the list and lets it collapse on exit. Clicking the cat or working in the panel keeps it open.
+
+## States and interaction
+
+Waiting and blocked sessions appear first. On macOS, the leading symbol carries the status color. Running uses a blue dot, monitoring a blue scope, waiting an amber pause, and blocked a red octagon. Done and unconfirmed tasks use a neutral checkmark and question mark. Rows align the neutral status text and time on the right. Long titles truncate visually and retain their full text for screen readers. Settings use grouped rows and size to the available content. Supported local single-choice questions have a Reply action alongside the task. A preset submits immediately. Other opens a draft when the provider accepts free text. A Core receipt returns the user to the list. Operations that can stop tasks show an inline confirmation with focus on Cancel.
+
+The macOS panel uses the AppKit popover material. The Windows panel uses Acrylic. The toolbar and task list share the same surface. Reduced transparency and increased contrast use a solid fill. The secondary-click menu uses OS styling.
+
+The macOS menu bar uses the cat mark from the application icon on a transparent background. A single 22-point ring adapts to the menu bar’s effective appearance. Blue represents execution or monitoring, amber waiting for input, and red blocked tasks. Each active category takes an equal share of the circumference. Shares adjust over 240 ms as categories appear or disappear. With one category the full ring breathes in place. With two or three categories the ribbon rotates clockwise every 4.8 seconds. The highlight travels counterclockwise every 2.6 seconds. The cat reflects the highlight as it crosses the bottom of the ring, with a short gleam on each ear in sequence. A successful reply triggers a brief confirmation glow. Idle shows the cat alone. A stationary neutral ring indicates that the task status could not be confirmed. Reduce Motion presents a static ring and cat immediately.
+
+The panel opens with a short fade. Switching task tabs selects the tab immediately and fades in the new list. Settings pages slide in by 6 points in the direction of navigation. Reduce Motion makes panel transitions immediate. The Windows tray shows an attention mark when a task needs input or is blocked. Its tooltip gives individual counts.
+
+Notch rows enter with a short stagger. A breathing blue ring marks tasks in progress, and a moving dot on the scope marks monitoring. The text stays still while their indicators move. With Reduce Motion enabled, the status marks and the island use static states.

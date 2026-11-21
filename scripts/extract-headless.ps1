@@ -35,7 +35,30 @@ function Assert-Sha256([string]$Path, [string]$Expected) {
 
 function Download-Pinned([string]$Url, [string]$Path, [string]$Sha256) {
     if (-not $Url.StartsWith('https://', [StringComparison]::Ordinal)) { throw 'HTTPS is required.' }
-    Invoke-WebRequest -Uri $Url -OutFile $Path -MaximumRedirection 8 -TimeoutSec 600
+    if ($Sha256 -cnotmatch '^[a-f0-9]{64}$') { throw "A pinned SHA256 is required: $Url" }
+    $cache = $env:ORCA_CORE_DOWNLOAD_CACHE
+    if (-not $cache) { $cache = Join-Path $PSScriptRoot '../dist-core/upstream-cache' }
+    $cache = [IO.Path]::GetFullPath($cache)
+    [void][IO.Directory]::CreateDirectory($cache)
+    $cached = Join-Path $cache $Sha256
+    $cacheHit = Test-Path -LiteralPath $cached -PathType Leaf
+    if ($cacheHit) {
+        if ((Get-Item -LiteralPath $cached).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Reparse points are not package inputs: $cached"
+        }
+        $cacheHit = (Get-FileHash -LiteralPath $cached -Algorithm SHA256).Hash -ieq $Sha256
+    }
+    if (-not $cacheHit) {
+        $partial = Join-Path $cache "$Sha256.$([Guid]::NewGuid().ToString('N')).part"
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $partial -MaximumRedirection 8 -TimeoutSec 600
+            Assert-Sha256 $partial $Sha256
+            [IO.File]::Move($partial, $cached, $true)
+        } finally {
+            [IO.File]::Delete($partial)
+        }
+    }
+    Copy-Item -LiteralPath $cached -Destination $Path
     Assert-Sha256 $Path $Sha256
 }
 

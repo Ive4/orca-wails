@@ -20,6 +20,29 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 
 TERMINAL_SHA256 = '1eeb6ec476884b533f1648f50d9571eda031b0928f35174c0d74feabc3e03bd6'
+CODEX_WORKERS = {
+    'codex-rollout-history-references-worker-entry.js': 'references',
+    'codex-history-disk-usage-worker-entry.js': 'disk-usage',
+}
+CODEX_WORKER_CHECK = r"""
+const { join } = require('node:path');
+const { Worker } = require('node:worker_threads');
+const home = process.argv[2];
+const references = process.argv[3] === 'references';
+const worker = new Worker(process.argv[1], { workerData: { cachePath: join(home, 'references.json') } });
+const request = references ? { id: 1, op: 'prepare', homes: [] } : {
+  id: 1, homes: [home], accounts: [], systemCodexHomePath: home,
+  budget: { maxEntries: 100, timeMs: 2000 },
+};
+const timer = setTimeout(() => process.exit(2), 5000);
+worker.once('message', (response) => {
+  clearTimeout(timer);
+  const result = references ? response.value === true :
+    response.usage?.complete === true && response.usage.rollouts === 1;
+  process.exit(response.id === 1 && response.ok && result ? 0 : 3);
+});
+worker.postMessage(request);
+"""
 
 # Bun's TTY stream aborts on EAGAIN. Retry on the same fd until bytes arrive,
 # EOF is reached, or node-pty destroys the stream. Keep native resize and writes.
@@ -160,6 +183,7 @@ def verify_start(runtime, core, manifest, profile):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--core-dir', type=Path, default=ROOT / 'dist-core/macos-arm64-bun-plugins')
+    parser.add_argument('--version-file', type=Path, default=ROOT / 'core-version.macos-arm64.json')
     args = parser.parse_args()
 
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
@@ -173,7 +197,7 @@ def main():
         core = scratch / 'core'
         unpack_core(archive, core)
         manifest = json.loads((core / 'core-manifest.json').read_text())
-        lock = json.loads((ROOT / 'core-version.macos-arm64.json').read_text())
+        lock = json.loads(args.version_file.read_text())
         bun = lock['bun']
         executable = f'runtimes/bun-{bun["version"]}/bun'
         if (manifest['version'], manifest['package_revision'], manifest['target'],
@@ -190,6 +214,21 @@ def main():
             raise ValueError('Packaged Bun version differs from the lock')
         profile = scratch / 'profile'
         profile.mkdir(mode=0o700)
+
+        slot = core / manifest['working_directory']
+        server = (slot / 'orcad-server.js').read_bytes()
+        worker_fixture = scratch / 'codex-worker-check'
+        (worker_fixture / 'sessions').mkdir(parents=True)
+        (worker_fixture / 'sessions/rollout-smoke.jsonl').write_text('{}\n')
+        for filename, check in CODEX_WORKERS.items():
+            if filename.encode() not in server:
+                continue
+            worker = slot / filename
+            if not worker.is_file():
+                raise ValueError(f'Core references a worker missing from the bundle: {worker.name}')
+            subprocess.run([runtime, '-e', CODEX_WORKER_CHECK, worker, worker_fixture, check],
+                           cwd=slot, check=True, timeout=10)
+            print(f'Bun Codex {check} worker answered successfully')
 
         for stage in ('fresh profile', 'same-profile restart'):
             verify_start(runtime, core, manifest, profile)

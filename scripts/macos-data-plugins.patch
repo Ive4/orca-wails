@@ -22,11 +22,11 @@ index 241113be..f9041bc4 100644
    })
  }
 +
-+/** Built beside the server for its consented, separately supervised plugin workers. */
-+export function buildOrcadPluginHost(outfile) {
++/** Build a worker beside the server using the same module conventions. */
++export function buildOrcadWorker(entryPoint, outfile) {
 +  return build({
 +    ...ORCAD_COMMONJS_MODULE_OPTIONS,
-+    entryPoints: [join(root, 'src/main/plugins/workers/plugin-host-entry.ts')],
++    entryPoints: [join(root, entryPoint)],
 +    bundle: true,
 +    platform: 'node',
 +    target: ORCAD_SERVER_BUILD_TARGET,
@@ -82,7 +82,7 @@ new file mode 100644
 index 00000000..ba67e900
 --- /dev/null
 +++ b/src/main/orcad/host-runtime/orcad-data-plugins.ts
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,801 @@
 +import { isPluginSourceModulePath } from '../../../shared/plugins/frames/plugin-frame-source-modules'
 +import { isAbsolute, join } from 'node:path'
 +import { version as desktopVersion } from '../../../../package.json'
@@ -91,6 +91,8 @@ index 00000000..ba67e900
 +  normalizePluginIdList
 +} from '../../../shared/plugins/approval/plugin-consent-state'
 +import { pluginCatalogReleaseCompatibilityError } from '../../../shared/plugins/manifest/plugin-manifest-compatibility'
++import { COMMUNITY_MARKETPLACE_GIT_SOURCE } from '../../../shared/plugins/catalog/plugin-install-link'
++import { isSameGitRepository } from '../../../shared/plugins/catalog/plugin-marketplace'
 +import { pluginHostVersion } from '../../../shared/plugins/installation/plugin-host-version'
 +import type { PluginManifest } from '../../../shared/plugins/manifest/plugin-manifest'
 +import {
@@ -121,8 +123,10 @@ index 00000000..ba67e900
 +import { PluginMarketplaceInstaller } from '../../plugins/catalog/plugin-marketplace-installer'
 +import {
 +  PluginMarketplaceService,
-+  type PluginMarketplaceListing
++  type PluginMarketplaceListing,
++  type PluginMarketplaceSourceState
 +} from '../../plugins/catalog/plugin-marketplace-service'
++import { pluginMarketplaceErrorMessage } from '../../plugins/catalog/plugin-marketplace-error-message'
 +import { refreshInstalledPluginCatalog } from '../../plugins/catalog/plugin-marketplace-shared-refresh'
 +import {
 +  installCatalogReleaseWithApproval,
@@ -196,8 +200,8 @@ index 00000000..ba67e900
 +  if (listing.blockedByKillList) {
 +    return listing.blockedByKillList.reason
 +  }
-+  if (!listing.official || !listing.release) {
-+    return 'Requires an official catalog release with a pinned commit and content hash.'
++  if (!listing.release) {
++    return 'Requires a catalog release with a pinned commit and content hash.'
 +  }
 +  if (listing.release.contributes?.some(({ kind }) => kind === 'fonts')) {
 +    return 'Plugin fonts require the desktop resource protocol.'
@@ -361,16 +365,36 @@ index 00000000..ba67e900
 +  return write
 +}
 +
++function isCommunityCatalog(source: PluginMarketplaceSourceState): boolean {
++  return isSameGitRepository(source.source.url, COMMUNITY_MARKETPLACE_GIT_SOURCE.url)
++}
++
++async function listBuiltInCatalogs(catalog: PluginMarketplaceService) {
++  await Promise.all([
++    catalog.seedOfficialSource(),
++    catalog.seedCommunitySource().catch(() => undefined)
++  ])
++  return (await catalog.listSources()).filter(
++    (source) => source.official || isCommunityCatalog(source)
++  )
++}
++
 +async function catalogRelease(state: DataHost, sourceId: string, pluginKey: string) {
 +  if (!state.service.options.isPluginSystemEnabled()) {
 +    throw new Error('The plugin system is disabled.')
 +  }
 +  const listing = await state.catalog.findPlugin(sourceId, pluginKey)
-+  const reason = listing
-+    ? unavailableReason(listing, state.hostVersion)
-+    : 'Plugin is absent from the official catalog.'
++  const community =
++    !listing?.official &&
++    (await state.catalog.listSources()).some(
++      (source) => source.id === sourceId && isCommunityCatalog(source)
++    )
++  const reason =
++    listing && (listing.official || community)
++      ? unavailableReason(listing, state.hostVersion)
++      : 'Plugin is absent from the built-in catalogs.'
 +  if (!listing?.release || reason) {
-+    throw new Error(reason ?? 'The official listing has no pinned release.')
++    throw new Error(reason ?? 'The catalog listing has no pinned release.')
 +  }
 +  return listing.release
 +}
@@ -545,8 +569,7 @@ index 00000000..ba67e900
 +    params: null,
 +    handler: async () => {
 +      const { catalog } = await host()
-+      await catalog.seedOfficialSource()
-+      return (await catalog.listSources()).filter((source) => source.official)
++      return listBuiltInCatalogs(catalog)
 +    }
 +  }),
 +  defineMethod({
@@ -555,9 +578,11 @@ index 00000000..ba67e900
 +    params: null,
 +    handler: async () => {
 +      const { catalog, hostVersion } = await host()
-+      await catalog.seedOfficialSource()
++      const community = new Set(
++        (await listBuiltInCatalogs(catalog)).filter(isCommunityCatalog).map((source) => source.id)
++      )
 +      return (await catalog.listPlugins())
-+        .filter((listing) => listing.official)
++        .filter((listing) => listing.official || community.has(listing.marketplaceSourceId))
 +        .map((listing) => ({
 +          ...listing,
 +          hostUnavailableReason: listing.blockedByKillList
@@ -572,9 +597,16 @@ index 00000000..ba67e900
 +    params: null,
 +    handler: async () => {
 +      const { catalog } = await host()
-+      const source = await catalog.seedOfficialSource()
-+      await catalog.refreshSourceShared(source.id)
-+      return (await catalog.listSources()).filter((source) => source.official)
++      const sources = await listBuiltInCatalogs(catalog)
++      return Promise.all(
++        sources.map(async (source) => {
++          try {
++            return await catalog.refreshSourceShared(source.id)
++          } catch (error) {
++            return { ...source, stale: true, error: pluginMarketplaceErrorMessage(error) }
++          }
++        })
++      )
 +    }
 +  }),
 +  defineMethod({
@@ -1221,7 +1253,7 @@ index 8aece1c1..afd4dfc8 100644
    ...PLUGIN_DEV_EMIT_METHODS,
    ...PLUGIN_DEV_REQUEST_METHODS,
 diff --git a/src/main/startup/pty-startup/main-process-pty-startup.ts b/src/main/startup/pty-startup/main-process-pty-startup.ts
-index 9aa0bcb4..0ba644af 100644
+index da17275..c5f830b 100644
 --- a/src/main/startup/pty-startup/main-process-pty-startup.ts
 +++ b/src/main/startup/pty-startup/main-process-pty-startup.ts
 @@ -1,7 +1,6 @@
@@ -1240,7 +1272,7 @@ index 9aa0bcb4..0ba644af 100644
 -import { notifyWorkspaceCreatedPluginHook } from '../../plugins/hooks/workspace-create-plugin-hook'
 -import { pluginListedWorkspaceId } from '../../plugins/workers/host-api/plugin-workspace-projection'
 +import { emitWorktreeLifecycleForPlugins } from '../../plugins/events/plugin-worktree-lifecycle'
- 
+
  export function emitPluginWorktreeLifecycle(event: RuntimeWorktreeLifecycleEvent): void {
 -  const folder = parseWorkspaceKey(event.worktreeId)?.type === 'folder'
 -  if (event.kind === 'created') {
@@ -1260,15 +1292,15 @@ index 9aa0bcb4..0ba644af 100644
 -    kind: 'worktree',
 -    path: event.path
 -  }
--  state.pluginService?.emitEvent(
+-  state.core.pluginService?.emitEvent(
 -    event.kind === 'created' ? 'workspace.created' : 'workspace.removed',
 -    event.kind === 'created'
 -      ? { ...identity, branch: shortPluginBranchName(event.branch) }
 -      : identity
 -  )
-+  emitWorktreeLifecycleForPlugins(state.pluginService, event)
++  emitWorktreeLifecycleForPlugins(state.core.pluginService, event)
  }
- 
+
  export function handleCodexHomePtySpawned(args: {
 diff --git a/src/preload/api/plugins/plugin-host-api.ts b/src/preload/api/plugins/plugin-host-api.ts
 index 9b52cc6e..4b8e495e 100644
@@ -1561,7 +1593,7 @@ index 2516cca3..583376ca 100644
 +        pairedPluginHost ? (
 +          t(
 +            'auto.components.settings.PluginsSettingsSection.catalogDescription',
-+            'Find extensions in the official catalog and manage the plugins you’ve installed.'
++            'Browse official and community plugins and manage your installed extensions.'
 +          )
 +        ) : (
 +          <PluginsSectionDescription text={sectionPresentation.description} />
@@ -1887,15 +1919,17 @@ index a04eb10c..886ac6ca 100644
            {
              id: 'plugins',
 diff --git a/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts b/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts
-index 85eac5e0..72ee44ba 100644
+index 9f527d7..aecd0be 100644
 --- a/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts
 +++ b/src/renderer/src/components/settings/navigation/useSettingsNavigationMetadata.ts
-@@ -1,3 +1,4 @@
+@@ -1,5 +1,6 @@
+ import { shallow } from 'zustand/shallow'
+ import { useAppStoreWithHostStatuses } from '@/store/slices/runtime-status/views/use-runtime-status-view'
 +import { useWebDataPluginsAvailable } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
  import { useSupportedGroupHookSettings } from '../repository/hooks/use-supported-group-hook-settings'
  import type { ProjectGroupSettingsEntry } from '../repository/hooks/use-supported-group-hook-settings'
  import { useMemo } from 'react'
-@@ -57,6 +58,7 @@ export function buildSettingsNavigationMetadata(
+@@ -58,6 +59,7 @@ export function buildSettingsNavigationMetadata(
      isLocalWindowsHost = isWindows,
      isWindowsTerminalHost = isWindows,
      isWebClient,
@@ -1903,7 +1937,7 @@ index 85eac5e0..72ee44ba 100644
      botsEnabled = true,
      hostQueuesMessages = false,
      typedChatPermissions = false,
-@@ -74,6 +76,7 @@ export function buildSettingsNavigationMetadata(
+@@ -75,6 +77,7 @@ export function buildSettingsNavigationMetadata(
      isLocalWindowsHost?: boolean
      isWindowsTerminalHost?: boolean
      isWebClient: boolean
@@ -1911,7 +1945,7 @@ index 85eac5e0..72ee44ba 100644
      botsEnabled?: boolean
      hostQueuesMessages?: boolean
      typedChatPermissions?: boolean
-@@ -111,6 +114,7 @@ export function buildSettingsNavigationMetadata(
+@@ -112,6 +115,7 @@ export function buildSettingsNavigationMetadata(
      isLocalWindowsHost,
      isWindowsTerminalHost,
      isWebClient,
@@ -1975,7 +2009,7 @@ index 7fefdd68..6f99587f 100644
 +          "turnOff": "关闭插件",
 +          "turnOn": "开启插件",
            "systemLabel": "插件系统",
-+          "catalogDescription": "在官方目录发现插件，管理已安装的扩展。",
++          "catalogDescription": "浏览官方和社区插件，管理已安装的扩展。",
            "loading": "正在加载插件…",
            "noInstalledResultsTitle": "没有匹配的插件",
            "noInstalledResults": "没有已安装的插件匹配此搜索",
@@ -2570,3 +2604,645 @@ index 2135e765..baf4f5ae 100644
    'desktop.openWindowInBackground': null,
    'desktopBrowserBridge.attach': DesktopBrowserBridgeAttachParams,
    'desktopBrowserBridge.result': DesktopBrowserBridgeResultParams,
+diff --git a/src/renderer/src/lib/files/os-open/local-path-open-guard.ts b/src/renderer/src/lib/files/os-open/local-path-open-guard.ts
+index 361a127..3df3c7b 100644
+--- a/src/renderer/src/lib/files/os-open/local-path-open-guard.ts
++++ b/src/renderer/src/lib/files/os-open/local-path-open-guard.ts
+@@ -7,6 +7,7 @@ import {
+ } from '../../../../../shared/execution-host/execution-host'
+ import type { ExecutionHostOwnerMatch } from '../../../../../shared/execution-host/worktree-execution-host-resolution'
+ import { translate } from '@/i18n/i18n'
++import { getWailsFinderBridge, wailsFinderBridge } from '@/web/preload-api/browser/web-finder'
+ import { getWindowsPathAccess } from './windows-path-access'
+
+ export type LocalPathOpenOwner =
+@@ -30,6 +31,9 @@ export function isLocalPathOpenBlocked(owner: LocalPathOpenOwner): boolean {
+  * host's, which Windows reaches through `\\wsl.localhost` (D5). Main re-checks the owner.
+  */
+ export function isRevealOrEditorOpenBlocked(owner: LocalPathOpenOwner): boolean {
++  if (wailsFinderBridge()) {
++    return !getWailsFinderBridge(getLocalPathOpenOwnerHostId(owner))
++  }
+   return (
+     isLocalPathOpenBlocked(owner) &&
+     getWindowsPathAccess(getLocalPathOpenOwnerHostId(owner)) === null
+@@ -46,11 +50,16 @@ export function getLocalPathOpenOwnerForRoute(route: {
+   if (route.ownerUnresolved) {
+     return 'unresolved'
+   }
++  // A Web runtime can route a local server's SSH workspace without owning its files.
++  const connectionId = route.connectionId?.trim()
++  if (connectionId && wailsFinderBridge()) {
++    return getConnectionExecutionHostId(connectionId)
++  }
+   const runtimeEnvironmentId = route.runtimeEnvironmentId?.trim()
+   if (runtimeEnvironmentId) {
+     return toRuntimeExecutionHostId(runtimeEnvironmentId)
+   }
+-  return getConnectionExecutionHostId(route.connectionId?.trim())
++  return getConnectionExecutionHostId(connectionId)
+ }
+
+ /** The inverse of {@link getLocalPathOpenOwnerForRoute}, for callers that still take a route. */
+diff --git a/src/renderer/src/web/preload-api/browser/web-finder.test.ts b/src/renderer/src/web/preload-api/browser/web-finder.test.ts
+new file mode 100644
+index 0000000..12f3a31
+--- /dev/null
++++ b/src/renderer/src/web/preload-api/browser/web-finder.test.ts
+@@ -0,0 +1,50 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { getWailsFinderBridge } from './web-finder'
++import {
++  isRevealOrEditorOpenBlocked,
++  getLocalPathOpenOwnerForRoute
++} from '@/lib/files/os-open/local-path-open-guard'
++import { createShellApi } from './web-shell-api'
++
++const fixtures = vi.hoisted(() => ({
++  environment: null as null | { id: string; endpoints: { endpoint: string }[] }
++}))
++vi.mock('../../runtime/client/web-runtime-session', () => ({
++  requireActiveEnvironmentOrNull: () => fixtures.environment
++}))
++
++afterEach(() => {
++  fixtures.environment = null
++  vi.unstubAllGlobals()
++})
++
++describe('Wails Finder reveal', () => {
++  it('enables only the runtime attached to the local window, preserving explicit SSH ownership', async () => {
++    const nativeReveal = vi.fn(async () => ({ ok: true }))
++    const host = '127.0.0.1:16768'
++    vi.stubGlobal('window', {
++      location: { protocol: 'http:', hostname: '127.0.0.1', host },
++      __orcaWailsRevealInFinder: nativeReveal
++    })
++    fixtures.environment = { id: 'here', endpoints: [{ endpoint: `ws://${host}/` }] }
++    expect(isRevealOrEditorOpenBlocked('runtime:here')).toBe(false)
++    expect(isRevealOrEditorOpenBlocked('runtime:another')).toBe(true)
++    expect(isRevealOrEditorOpenBlocked('unresolved')).toBe(true)
++    const sshOwner = getLocalPathOpenOwnerForRoute({
++      runtimeEnvironmentId: 'here',
++      connectionId: 'ssh-target'
++    })
++    expect(isRevealOrEditorOpenBlocked(sshOwner)).toBe(true)
++    await expect(
++      createShellApi().openInFileManager('/tmp/project/example.txt', 'runtime:here')
++    ).resolves.toEqual({ ok: true })
++    expect(sshOwner).toBe('ssh:ssh-target')
++    await expect(
++      createShellApi().openInFileManager('/tmp/project/example.txt', 'ssh:ssh-target')
++    ).resolves.toEqual({ ok: false, reason: 'remote-runtime-unsupported' })
++    expect(nativeReveal).toHaveBeenCalledExactlyOnceWith('/tmp/project/example.txt')
++    fixtures.environment.endpoints.push({ endpoint: 'wss://remote.example/' })
++    expect(isRevealOrEditorOpenBlocked('runtime:here')).toBe(true)
++    expect(getWailsFinderBridge('runtime:here')).toBeUndefined()
++  })
++})
+diff --git a/src/renderer/src/web/preload-api/browser/web-finder.ts b/src/renderer/src/web/preload-api/browser/web-finder.ts
+new file mode 100644
+index 0000000..78107ce
+--- /dev/null
++++ b/src/renderer/src/web/preload-api/browser/web-finder.ts
+@@ -0,0 +1,36 @@
++import type { ShellOpenLocalPathResult } from '../../../../../shared/shell/opening/shell-open-types'
++import { parseRoutableExecutionHostId } from '../../../../../shared/execution-host/execution-host'
++import { requireActiveEnvironmentOrNull } from '../../runtime/client/web-runtime-session'
++
++type RevealInFinder = (path: string) => Promise<ShellOpenLocalPathResult>
++
++export function wailsFinderBridge(): RevealInFinder | undefined {
++  if (typeof window === 'undefined') {
++    return undefined
++  }
++  return (window as Window & { __orcaWailsRevealInFinder?: RevealInFinder })
++    .__orcaWailsRevealInFinder
++}
++
++export function getWailsFinderBridge(owner: string): RevealInFinder | undefined {
++  const bridge = wailsFinderBridge()
++  if (!bridge || window.location.hostname !== '127.0.0.1' || window.location.protocol !== 'http:') {
++    return undefined
++  }
++  const environment = requireActiveEnvironmentOrNull()
++  const endpoint = `ws://${window.location.host}`
++  if (
++    !environment?.endpoints.length ||
++    !environment.endpoints.every(({ endpoint: url }) => url === endpoint || url === `${endpoint}/`)
++  ) {
++    return undefined
++  }
++  const host = parseRoutableExecutionHostId(owner)
++  if (
++    host?.kind === 'local' ||
++    (host?.kind === 'runtime' && host.environmentId === environment.id)
++  ) {
++    return bridge
++  }
++  return undefined
++}
+diff --git a/src/renderer/src/web/preload-api/browser/web-shell-api.ts b/src/renderer/src/web/preload-api/browser/web-shell-api.ts
+index e27afc0..b9aba65 100644
+--- a/src/renderer/src/web/preload-api/browser/web-shell-api.ts
++++ b/src/renderer/src/web/preload-api/browser/web-shell-api.ts
+@@ -1,5 +1,6 @@
+ import type { PreloadApi } from '../../../../../preload/api-types'
+ import { holdBrowserAttachmentFiles } from '@/lib/files/drop/browser-attachment-files'
++import { getWailsFinderBridge, wailsFinderBridge } from './web-finder'
+ import { resolveRuntimeFilePath } from '../workspaces/web-runtime-worktree-catalog'
+
+ async function pathExistsOnRuntime(path: string): Promise<boolean> {
+@@ -28,7 +29,20 @@ export function createShellApi(): NonNullable<Partial<PreloadApi>['shell']> {
+   return {
+     openPath: (path) =>
+       Promise.resolve(window.open(path, '_blank', 'noopener,noreferrer') as never),
+-    openInFileManager: () => Promise.resolve(openResult),
++    openInFileManager: async (path, owner) => {
++      if (!wailsFinderBridge()) {
++        return openResult
++      }
++      const reveal = getWailsFinderBridge(owner)
++      if (!reveal) {
++        return { ok: false, reason: 'remote-runtime-unsupported' }
++      }
++      try {
++        return await reveal(path)
++      } catch {
++        return { ok: false, reason: 'launch-failed' }
++      }
++    },
+     openInExternalEditor: () => Promise.resolve(openResult),
+     openUrl: (url) => Promise.resolve(window.open(url, '_blank', 'noopener,noreferrer') as never),
+     openFilePath: () => Promise.resolve(false),
+diff --git a/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts b/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts
+index 0900d91..ab04db9 100644
+--- a/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts
++++ b/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts
+@@ -12,6 +12,7 @@ import {
+ import { nativeChatPreferenceFor } from '../../../../../shared/agent-launch/choices/structured-native-chat-launch-route'
+ import type { AgentMenuRowsTarget, NewTabAgentMenuModel } from './new-tab-agent-menu-model'
+
++import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import { useMemo } from 'react'
+ import { useShallow } from 'zustand/react/shallow'
+ import { readRuntimeStatusesForView } from '@/store/slices/runtime-status/views/runtime-status-owner'
+@@ -54,15 +55,18 @@ export function useNewTabAgentMenuRows(
+   detectionTarget: AgentDetectionTarget | undefined,
+   options?: AgentMenuObservationOptions
+ ): NewTabAgentMenuModel {
+-  // Only the new-tab menu opens setup chats; pickers that save an agent need one that runs.
+   return useAgentMenuObservation(target, open, detectionTarget, {
+     ...options,
+-    offerAgentSetup: true
++    onlyEnabledChats: true
+   }).model
+ }
+
+ /** `wakeOnOpen`: `open` is the user opening this picker, a user act that may start its WSL distro. */
+-export type AgentMenuObservationOptions = { wakeOnOpen?: boolean; offerAgentSetup?: boolean }
++export type AgentMenuObservationOptions = {
++  wakeOnOpen?: boolean
++  offerAgentSetup?: boolean
++  onlyEnabledChats?: boolean
++}
+
+ export function useAgentMenuObservation(
+   target: string | AgentMenuRowsTarget | null,
+@@ -234,14 +238,28 @@ export function useAgentMenuObservation(
+     ? undefined
+     : ExecutionHost.parseExecutionHostId(facts.executionHostId)?.id
+   const { detectedIds } = detection
++  // A paired Web client keeps its own disabled agents alongside the host's restrictions.
++  const menuSettings =
++    options?.onlyEnabledChats && isWebClientLocation()
++      ? {
++          ...settings,
++          disabledTuiAgents: [
++            ...new Set([
++              ...(settings?.disabledTuiAgents ?? []),
++              ...(desktopSettings?.disabledTuiAgents ?? [])
++            ])
++          ]
++        }
++      : settings
+   const rows = buildNewTabAgentMenuRows({
+-    settings,
++    settings: menuSettings,
+     detectedOnHost: detectedIds,
+     chatAgents,
+     chatProgram: (agent) =>
+       unresolvedTarget ? 'unlearned' : readChatProgram(hostStatuses, agent, input, detectedIds),
+     hostChatAnswer: answerFor,
+     offerAgentSetup: options?.offerAgentSetup,
++    onlyEnabledChats: options?.onlyEnabledChats,
+     hostPlatform: facts.hostPlatform
+   }).map((row) => ({ ...row, executionHostId }))
+   const model: NewTabAgentMenuModel = loading
+diff --git a/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-host-preferences.test.tsx b/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-host-preferences.test.tsx
+index 13493f9..aa363cd 100644
+--- a/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-host-preferences.test.tsx
++++ b/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-host-preferences.test.tsx
+@@ -11,6 +11,7 @@ import '../../../runtime/agent-launch-settings/agent-launch-settings-transport'
+ import '../../../runtime/agent-launch-settings/use-host-agent-launch-preferences'
+ import '../use-agent-launch-picker-inventory'
+
++import { useBotAgentMenu } from '../../bots/use-bot-agent-choices'
+ import { useNewTabAgentMenuRows } from './use-new-tab-agent-menu-rows'
+
+ it('ignores old reads across host switches, restarts, and re-pairing', async () => {
+@@ -82,3 +83,54 @@ it('stops waiting on a stalled host, then applies its late answer', async () =>
+     vi.useRealTimers()
+   }
+ })
++
++it('keeps agents disabled in the web client out of the workspace menu', async () => {
++  vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
++  const settings = useAppStore.getState().settings!
++  useAppStore.setState({ settings: { ...settings, agentDefaultSurface: 'chat' } })
++  try {
++    const hook = renderHook(() =>
++      useNewTabAgentMenuRows('wt', true, { kind: 'runtime', environmentId: 'alpha' })
++    )
++    await act(async () => {})
++    const agents = () => {
++      const model = hook.result.current
++      return model.state === 'settled' ? [...new Set(model.rows.map((row) => row.agent))] : []
++    }
++
++    expect(agents()).toEqual(['claude'])
++    act(() =>
++      useAppStore.setState({
++        settings: { ...settings, agentDefaultSurface: 'chat', disabledTuiAgents: [] }
++      })
++    )
++    expect(agents()).toEqual(expect.arrayContaining(['claude', 'codex']))
++    expect(agents()).not.toContain('opencode')
++  } finally {
++    vi.unstubAllGlobals()
++  }
++})
++
++it('offers new bots only available chats enabled by both the web client and host', async () => {
++  vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
++  const settings = { ...useAppStore.getState().settings!, agentDefaultSurface: 'chat' as const }
++  useAppStore.setState({ settings })
++  try {
++    const hook = renderHook(() => useBotAgentMenu('runtime:alpha', true))
++    await act(async () => {})
++
++    expect(hook.result.current.choices).toEqual(['claude'])
++
++    act(() =>
++      useAppStore.setState({
++        settings: { ...settings, disabledTuiAgents: [], nativeChatProviders: { codex: false } }
++      })
++    )
++    expect(hook.result.current.choices).toEqual(['claude'])
++
++    act(() => useAppStore.setState({ settings: { ...settings, disabledTuiAgents: [] } }))
++    expect(hook.result.current.choices).toEqual(['claude', 'codex'])
++  } finally {
++    vi.unstubAllGlobals()
++  }
++})
+diff --git a/src/renderer/src/components/bots/use-bot-agent-choices.ts b/src/renderer/src/components/bots/use-bot-agent-choices.ts
+index 5a65d34..cc944aa 100644
+--- a/src/renderer/src/components/bots/use-bot-agent-choices.ts
++++ b/src/renderer/src/components/bots/use-bot-agent-choices.ts
+@@ -3,7 +3,7 @@ import { botHostTarget } from '@/lib/bot-hosts'
+ import type { ExecutionHostId } from '../../../../shared/execution-host/execution-host'
+ import type { AgentDetectionTarget } from '@/lib/agent-session/launch/inventory/useDetectedAgents'
+ import type { BotAgent } from '../../../../shared/bot-types'
+-import { useNewTabAgentMenuRows } from '../agent/launch-menu/use-new-tab-agent-menu-rows'
++import { useAgentMenuObservation } from '../agent/launch-menu/use-new-tab-agent-menu-rows'
+ import type {
+   AgentMenuRowsTarget,
+   NewTabAgentMenuModel
+@@ -27,7 +27,12 @@ export function useBotAgentMenu(
+       ? { kind: 'runtime', environmentId: target.environmentId }
+       : target
+   }, [hostId])
+-  const model = useNewTabAgentMenuRows(home, open, detection)
++  const { model } = useAgentMenuObservation(
++    home,
++    open,
++    detection,
++    current === undefined ? { onlyEnabledChats: true } : { offerAgentSetup: true }
++  )
+   return { model, choices: botAgentChoices(model, current) }
+ }
+
+diff --git a/src/renderer/src/components/bots/NewBotDialog.host-models.test.tsx b/src/renderer/src/components/bots/NewBotDialog.host-models.test.tsx
+index 5c8389b..0f5a3ab 100644
+--- a/src/renderer/src/components/bots/NewBotDialog.host-models.test.tsx
++++ b/src/renderer/src/components/bots/NewBotDialog.host-models.test.tsx
+@@ -48,6 +48,7 @@ it("lists the picked computer's Codex models, and the new computer's after switc
+       : entry
+   }
+   useAppStore.setState({
++    settings: { ...useAppStore.getState().settings!, nativeChatProviders: { codex: true } },
+     runtimeEnvironments: [
+       publicRuntimeEnvironment({ id: 'alpha' }),
+       publicRuntimeEnvironment({ id: 'beta' })
+diff --git a/src/shared/agent-launch/picker/agent-launch-picker-rows.test.ts b/src/shared/agent-launch/picker/agent-launch-picker-rows.test.ts
+index 82cc031..fbfb0b6 100644
+--- a/src/shared/agent-launch/picker/agent-launch-picker-rows.test.ts
++++ b/src/shared/agent-launch/picker/agent-launch-picker-rows.test.ts
+@@ -1,4 +1,4 @@
+-import { expect, it } from 'vitest'
++import { describe, expect, it } from 'vitest'
+ import { buildNewTabAgentMenuRows, type ChatProgramObservation } from './agent-launch-picker-rows'
+ import type { TuiAgent } from '../catalog/tui-agent'
+
+@@ -28,3 +28,69 @@ it('marks a chat as setup only when its agent is not installed on the host', ()
+     agent: 'antigravity'
+   })
+ })
++
++describe('workspace new-tab chat rows', () => {
++  it('keeps enabled chats and removes the chat option for terminal-only agents', () => {
++    const rows = buildNewTabAgentMenuRows({
++      onlyEnabledChats: true,
++      settings: {
++        agentDefaultSurface: 'chat',
++        nativeChatProviders: { codex: false },
++        disabledTuiAgents: ['opencode']
++      },
++      detectedOnHost: ['claude', 'codex', 'opencode'],
++      chatAgents: ['claude', 'codex', 'opencode'],
++      hostChatAnswer: () => 'yes',
++      chatProgram: () => 'available'
++    })
++
++    expect(rows).toEqual([
++      { kind: 'chat', agent: 'claude' },
++      { kind: 'cli', agent: 'codex' }
++    ])
++  })
++
++  it('does not revive disabled chats as setup suggestions on an empty host', () => {
++    const rows = buildNewTabAgentMenuRows({
++      onlyEnabledChats: true,
++      settings: { agentDefaultSurface: 'terminal' },
++      detectedOnHost: [],
++      chatAgents: ['claude', 'codex'],
++      hostChatAnswer: () => 'yes',
++      chatProgram: () => 'installable',
++      offerAgentSetup: true,
++      hostPlatform: 'darwin'
++    })
++
++    expect(rows).toEqual([])
++  })
++
++  it('shows the available chat and hides agents that would require installation', () => {
++    const rows = buildNewTabAgentMenuRows({
++      onlyEnabledChats: true,
++      settings: { agentDefaultSurface: 'chat' },
++      detectedOnHost: ['codex'],
++      chatAgents: ['codex', 'grok', 'pi'],
++      hostChatAnswer: () => 'yes',
++      chatProgram: (agent) =>
++        agent === 'codex' ? 'available' : agent === 'grok' ? 'installable' : 'missing',
++      offerAgentSetup: true,
++      hostPlatform: 'darwin'
++    })
++
++    expect(rows).toEqual([{ kind: 'chat', agent: 'codex' }])
++  })
++
++  it('honors an explicitly enabled chat with Terminal as the default', () => {
++    const rows = buildNewTabAgentMenuRows({
++      onlyEnabledChats: true,
++      settings: { agentDefaultSurface: 'terminal', nativeChatProviders: { codex: true } },
++      detectedOnHost: ['codex'],
++      chatAgents: ['codex'],
++      hostChatAnswer: () => 'yes',
++      chatProgram: () => 'available'
++    })
++
++    expect(rows).toEqual([{ kind: 'chat', agent: 'codex' }])
++  })
++})
+diff --git a/src/shared/agent-launch/picker/agent-launch-picker-rows.ts b/src/shared/agent-launch/picker/agent-launch-picker-rows.ts
+--- a/src/shared/agent-launch/picker/agent-launch-picker-rows.ts
++++ b/src/shared/agent-launch/picker/agent-launch-picker-rows.ts
+@@ -69,4 +69,5 @@
+   /** Offer chats for agents the host lacks: the chat walks through installing and signing in. */
+   offerAgentSetup?: boolean
++  onlyEnabledChats?: boolean
+   hostPlatform?: string | null
+ }): NewTabAgentMenuRow[] {
+@@ -83,7 +84,4 @@
+   const unavailable = new Map<TuiAgent, ChatUnavailableReason>()
+   const chatAgents = filterEnabledTuiAgents(args.chatAgents, settings?.disabledTuiAgents)
+-  const canOpen = (agent: TuiAgent): boolean =>
+-    chatProgramOffered(args.chatProgram(agent)) ||
+-    (args.chatProgram(agent) === 'unknown' && installed.includes(agent))
+   // Only uninstalled programs: an unreadable one stays a failed check, never an install prompt.
+   const needsSetup = (agent: TuiAgent): boolean =>
+@@ -96,5 +94,11 @@
+   for (const agent of chatAgents) {
+     const displayed = nativeChatPreferenceFor(settings, agent)
+-    if (!displayed && (!installed.includes(agent) || !canOpen(agent))) {
++    const program = args.chatProgram(agent)
++    const canOpen =
++      chatProgramOffered(program) || (program === 'unknown' && installed.includes(agent))
++    if (args.onlyEnabledChats && (!displayed || !canOpen || program === 'installable')) {
++      continue
++    }
++    if (!displayed && (!installed.includes(agent) || !canOpen)) {
+       continue
+     }
+@@ -106,6 +110,5 @@
+       continue
+     }
+-    const program = args.chatProgram(agent)
+-    if (answer === 'yes' && (canOpen(agent) || needsSetup(agent))) {
++    if (answer === 'yes' && (canOpen || needsSetup(agent))) {
+       runnable.push(agent)
+     } else {
+@@ -127,5 +130,10 @@
+   }
+   // A host with no agents at all offers chats that set one up, so a first agent is findable.
+-  if (runnable.length === 0 && unavailable.size === 0 && installed.length === 0) {
++  if (
++    !args.onlyEnabledChats &&
++    runnable.length === 0 &&
++    unavailable.size === 0 &&
++    installed.length === 0
++  ) {
+     runnable.push(
+       ...chatAgents.filter((agent) => needsSetup(agent) && args.hostChatAnswer(agent) === 'yes')
+diff --git a/src/renderer/src/components/terminal-pane/links/files/terminal-file-link-actions.ts b/src/renderer/src/components/terminal-pane/links/files/terminal-file-link-actions.ts
+--- a/src/renderer/src/components/terminal-pane/links/files/terminal-file-link-actions.ts
++++ b/src/renderer/src/components/terminal-pane/links/files/terminal-file-link-actions.ts
+@@ -10,7 +10,10 @@
+ import { isTerminalLinkDirectActivation } from '../gestures/terminal-link-activation'
+ import { requestTerminalLinkAction } from '../terminal-link-action-request'
+ import type { TerminalLinkActionContext } from '../terminal-link-action-request'
+-import { resolveKnownWorktreeRootPathLink } from './terminal-worktree-path-link'
++import {
++  resolveKnownWorktreeRootPathLink,
++  terminalFileSourceHost
++} from './terminal-worktree-path-link'
+ import { translate } from '@/i18n/i18n'
+ import {
+   getRevealInFileManagerLabel,
+@@ -24,6 +27,7 @@
+ import '@/store/slices/editor/tabs/editor-open-target-group'
+ import { canOpenLinkInSourceGroup } from '@/lib/links/placement/link-open-intent'
+ import { isPairedWebClientWindow } from '@/app-shell/chrome/desktop-window-chrome'
++import { getWailsHtmlPreviewBridge } from '@/web/preload-api/browser/web-html-preview'
+ import type { FileOpenFailure } from './terminal-file-open-failure'
+ import type { LinkActionRequest } from '@/components/link-actions/link-action-request'
+ import type { HttpLinkSourceOwner } from '@/lib/browser/navigation/http-link-routing'
+@@ -195,10 +199,18 @@
+         }
+       : null
+   const secondaryActions = [downloadRow, openInGroupRow, revealRow].filter((row) => row !== null)
++  const wailsHtmlPreview =
++    !worktreeRoot &&
++    deps.hostFileOnly &&
++    fileContext.sourceHostResolved &&
++    !fileContext.connectionId &&
++    !looksLikeFolder &&
++    isHtmlFilePath(mappedPath) &&
++    getWailsHtmlPreviewBridge(terminalFileSourceHost(useAppStore.getState(), fileContext))
+   const rows =
+-    !worktreeRoot && canOpenWithSystemDefault && isHtmlFilePath(mappedPath)
++    wailsHtmlPreview || (!worktreeRoot && canOpenWithSystemDefault && isHtmlFilePath(mappedPath))
+       ? buildHttpLinkActions(
+-          localHtmlFileDestinations(),
++          wailsHtmlPreview ? { primary: 'orca' } : localHtmlFileDestinations(),
+           (browserDestination) =>
+             openDetectedFilePath(filePath, line, column, { ...deps, browserDestination }),
+           undefined,
+@@ -228,6 +240,7 @@
+     destination: mappedPath,
+     kind: worktreeRoot ? 'workspace' : 'file',
+     ...rows,
++    ...(wailsHtmlPreview && systemDefaultRow ? { alternate: systemDefaultRow } : {}),
+     ...(secondaryActions.length > 0 ? { secondaryActions } : {})
+   }
+ }
+diff --git a/src/renderer/src/components/terminal-pane/links/files/terminal-file-open-routing.ts b/src/renderer/src/components/terminal-pane/links/files/terminal-file-open-routing.ts
+--- a/src/renderer/src/components/terminal-pane/links/files/terminal-file-open-routing.ts
++++ b/src/renderer/src/components/terminal-pane/links/files/terminal-file-open-routing.ts
+@@ -42,6 +42,7 @@
+ import { isHtmlFilePath, localHtmlFileDestinations } from './local-html-file-destinations'
+ import type { FileOpenFailure } from './terminal-file-open-failure'
+ import { openDetectedFolder } from './terminal-folder-open'
++import { getWailsHtmlPreviewBridge } from '@/web/preload-api/browser/web-html-preview'
+
+ type TerminalFileOpenDeps = {
+   worktreeId: string
+@@ -195,6 +196,24 @@
+         : downloadRemoteTerminalFile(fileContext, mappedFilePath, hostGrant))
+       return
+     }
++    if (
++      deps.hostFileOnly &&
++      !fileContext.connectionId &&
++      !explicitGroupRequest &&
++      !openWithSystemDefault &&
++      deps.browserDestination !== 'system' &&
++      !statResult.isDirectory &&
++      isHtmlFilePath(mappedFilePath)
++    ) {
++      const preview = getWailsHtmlPreviewBridge(sourceFileHostId)
++      if (preview) {
++        const opened = await preview(mappedFilePath).catch(() => false)
++        if (!opened && isCurrentRequest()) {
++          deps.onOpenFailure?.({ verdict: 'unverifiable', error: new Error('HTML preview failed') })
++        }
++        return
++      }
++    }
+     // Remote hints promise Orca before resolution; explicit group requests must reach HTML branch to be refused.
+     const pageDestination =
+       canOpenWithSystemDefault &&
+diff --git a/src/renderer/src/components/terminal-pane/links/terminal-link-paired-click-fallback.test.ts b/src/renderer/src/components/terminal-pane/links/terminal-link-paired-click-fallback.test.ts
+--- a/src/renderer/src/components/terminal-pane/links/terminal-link-paired-click-fallback.test.ts
++++ b/src/renderer/src/components/terminal-pane/links/terminal-link-paired-click-fallback.test.ts
+@@ -3,6 +3,7 @@
+ import { getConnectionId } from '@/lib/workspace/ownership/connection-context'
+ import { openFilePathLinkAtBufferPosition } from './files/terminal-file-link-hit-testing'
+ import { openDetectedFilePath } from './files/terminal-file-open-routing'
++import { buildFileLinkActions } from './files/terminal-file-link-actions'
+ import { createTerminalLinkTestDoubles } from './terminal-link-handlers-test-fixtures'
+ import { getTerminalPathExistsCacheKey } from './files/terminal-path-exists-cache'
+ import { replaceRuntimeEnvironmentRevisions } from '@/runtime/rpc/environment-revisions/runtime-environment-revision'
+@@ -35,6 +36,14 @@
+
+ vi.mock('@/lib/workspace/ownership/connection-context', () => ({
+   getConnectionId: vi.fn(() => null)
++}))
++
++vi.mock('@/web/runtime/client/web-runtime-session', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/web/runtime/client/web-runtime-session')>()),
++  requireActiveEnvironmentOrNull: () => ({
++    id: 'env-1',
++    endpoints: [{ endpoint: 'ws://127.0.0.1:16768/' }]
++  })
+ }))
+
+ installTerminalLinkTestEnvironment(doubles)
+@@ -105,6 +114,41 @@
+   })
+ }
+
++it.each([
++  ['env-1', 'Orca Browser', true],
++  ['another-runtime', 'Open file', false]
++])(
++  'routes an HTML chat link on %s to the correct surface',
++  async (runtimeEnvironmentId, label, local) => {
++    setPlatform('Macintosh')
++    const preview = vi.fn().mockResolvedValue(true)
++    vi.stubGlobal('window', {
++      ...window,
++      location: { protocol: 'http:', hostname: '127.0.0.1', host: '127.0.0.1:16768' },
++      __orcaWailsRevealInFinder: vi.fn(),
++      __orcaWailsPreviewHTML: preview
++    })
++    hostAnswers((path) => ({ exists: path === 'report.html' }))
++    const target = '/srv/repo/report.html'
++    const deps = {
++      worktreeId: 'wt-1',
++      worktreePath: '/srv/repo',
++      runtimeEnvironmentId,
++      hostFileOnly: true
++    }
++
++    const actions = buildFileLinkActions(target, null, null, deps, undefined)
++    expect(actions.primary.label).toBe(label)
++    expect(actions.alternate?.label).toBe('Download & open with default app')
++    await actions.primary.run()
++    await flushDoubleRaf()
++    expect(preview.mock.calls).toEqual(local ? [[target]] : [])
++    if (local) {
++      expect(openFileMock).not.toHaveBeenCalled()
++    }
++  }
++)
++
+ describe('a modifier-click on a paired-server path followed by more paths', () => {
+   it('opens the clicked path, not the guess joining it to the rows below', async () => {
+     setPlatform('Macintosh')
+diff --git a/src/renderer/src/web/preload-api/browser/web-html-preview.ts b/src/renderer/src/web/preload-api/browser/web-html-preview.ts
+new file mode 100644
+--- /dev/null
++++ b/src/renderer/src/web/preload-api/browser/web-html-preview.ts
+@@ -0,0 +1,10 @@
++import { getWailsFinderBridge } from './web-finder'
++
++type PreviewHTML = (path: string) => Promise<boolean>
++
++export function getWailsHtmlPreviewBridge(owner: string | null): PreviewHTML | undefined {
++  if (!owner || !getWailsFinderBridge(owner)) {
++    return undefined
++  }
++  return (window as Window & { __orcaWailsPreviewHTML?: PreviewHTML }).__orcaWailsPreviewHTML
++}

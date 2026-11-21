@@ -24,7 +24,7 @@ import (
 	"orca-wails/internal/tasks"
 )
 
-const panelWidth, panelHeight = 320, 420
+const panelWidth, panelHeight, panelRadius = 336, 420, 24
 
 //go:embed assets/tray/*
 var panelAssets embed.FS
@@ -43,18 +43,14 @@ type panelAction struct {
 
 func (d *desktop) configureTray() {
 	d.tray = d.app.SystemTray.New()
-	if runtime.GOOS == "darwin" {
-		d.tray.SetTemplateIcon(trayIcon)
-	} else {
-		d.tray.SetIcon(trayColorIcon)
-	}
-	d.tray.SetTooltip(appName)
+	d.setTrayLights(trayTaskLights{})
 	d.tray.OnClick(func() { go d.togglePanel() })
 	menu := application.NewMenu()
+	menu.Add("任务").OnClick(func(*application.Context) { go d.togglePanel() })
+	menu.Add("机器人").OnClick(func(*application.Context) { d.request("open_bots", nil) })
 	menu.Add("打开 Orca").OnClick(func(*application.Context) { d.request("open", nil) })
-	menu.Add("打开任务面板").OnClick(func(*application.Context) { go d.togglePanel() })
-	menu.Add("关闭 Orca 窗口").OnClick(func(*application.Context) { d.request("close_orca", nil) })
 	menu.AddSeparator()
+	menu.Add("关闭 Orca 窗口").OnClick(func(*application.Context) { d.request("close_orca", nil) })
 	menu.Add("退出 " + appName).OnClick(func(*application.Context) { d.quit() })
 	d.tray.SetMenu(menu)
 }
@@ -85,23 +81,26 @@ func (d *desktop) togglePanel() {
 		p := &trayPanel{token: hex.EncodeToString(randomToken())}
 		d.panel.Store(p)
 		options := application.WebviewWindowOptions{
-			Name: "orca-tray", Title: "Orca 任务", URL: "/tray/index.html#" + p.token,
+			Name: "orca-tray", Title: "Orca 托盘", URL: "/tray/index.html#" + p.token,
 			Width: panelWidth, Height: panelHeight, Hidden: true,
 			Frameless: true, AlwaysOnTop: true, DisableResize: true,
 			BackgroundType:             application.BackgroundTypeTransparent,
 			DefaultContextMenuDisabled: true, Permissions: untrustedPermissions(),
 		}
-		if runtime.GOOS == "darwin" {
+		switch runtime.GOOS {
+		case "darwin":
 			options.Mac = application.MacWindow{
 				WindowClass:  application.MacWindowClassPanel,
 				Backdrop:     application.MacBackdropLiquidGlass,
-				CornerRadius: 24,
-				LiquidGlass: application.MacLiquidGlass{
-					Material:     application.NSVisualEffectMaterialPopover,
-					CornerRadius: 24,
-				},
+				CornerRadius: panelRadius,
+				LiquidGlass:  application.MacLiquidGlass{CornerRadius: panelRadius},
 			}
-			options.JS = `document.body.setAttribute("data-native-material", "");`
+		case "windows":
+			options.BackgroundType = application.BackgroundTypeTranslucent
+			options.Windows.BackdropType = application.Acrylic
+		}
+		if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			options.URL = "/tray/index.html?material=frosted#" + p.token
 		}
 		p.win = d.app.Window.NewWithOptions(options)
 		p.win.OnWindowEvent(events.Common.WindowLostFocus, func(*application.WindowEvent) {
@@ -227,7 +226,8 @@ func (d *desktop) panelSnapshot(page string) map[string]any {
 	if d.coreUpdate != nil {
 		pendingCore = d.coreUpdate.DisplayVersion()
 	}
-	autostart := d.autostart
+	autostart, notifications := d.autostart, d.notifications
+	entries := d.entries
 	d.statusMu.RUnlock()
 
 	win, busy := d.window.Load(), d.busy.Load()
@@ -235,6 +235,17 @@ func (d *desktop) panelSnapshot(page string) map[string]any {
 		"availableHeight": panelHeight, "busy": busy}
 
 	switch page {
+	case "native":
+		result["summary"] = summary
+		result["autostart"] = autostart
+		result["notifications"] = notifications
+		result["entries"] = entries
+		result["windowOpen"] = win != nil
+		result["localWindowReady"] = win != nil && !win.paired && win.ready.Load()
+		result["running"] = status.Phase == "running"
+		result["pendingApp"] = pendingApp
+		result["pendingCore"] = pendingCore
+		result["officialVersion"] = official
 	case "settings":
 		result["shell"] = map[string]any{"autostart": autostart, "windowOpen": win != nil,
 			"importOfficial": runtime.GOOS == "darwin"}
@@ -284,6 +295,14 @@ func (d *desktop) runPanelAction(p *trayPanel, action panelAction) error {
 		})
 	case "close":
 		go d.closePanel(p)
+	default:
+		return d.runTrayAction(action, func() { go d.closePanel(p) })
+	}
+	return nil
+}
+
+func (d *desktop) runTrayAction(action panelAction, dismiss func()) error {
+	switch action.Kind {
 	case "retry_tasks":
 		d.statusMu.Lock()
 		d.taskAttempted, d.taskSummary = false, nil
@@ -292,21 +311,10 @@ func (d *desktop) runPanelAction(p *trayPanel, action panelAction) error {
 		case d.retryTasks <- struct{}{}:
 		default:
 		}
-	case "open":
-		status := d.core.Status()
+	case "open", "open_bots":
 		var target *tasks.Target
-		if action.ID != "" {
-			d.statusMu.RLock()
-			if status.Phase == "running" && status.PID == d.taskPID && d.taskSummary != nil {
-				for _, row := range d.taskSummary.Rows {
-					if row.ID == action.ID {
-						item := row.Target
-						target = &item
-						break
-					}
-				}
-			}
-			d.statusMu.RUnlock()
+		if action.Kind == "open" && action.ID != "" {
+			target = d.trayTaskTarget(action.ID)
 			if target == nil {
 				return errors.New("任务状态已变化，请刷新后重试")
 			}
@@ -314,9 +322,9 @@ func (d *desktop) runPanelAction(p *trayPanel, action panelAction) error {
 		if w := d.window.Load(); d.busy.Load() && (w == nil || w.paired) {
 			return errors.New("Orca 正忙，请稍后再试")
 		}
-		go d.closePanel(p)
-		d.request("open", target)
-	case "open_paired", "close_orca", "import_official", "check_app", "install_app", "check_core", "install_core", "check_official",
+		dismiss()
+		d.request(action.Kind, target)
+	case "start", "open_paired", "close_orca", "import_official", "check_app", "install_app", "check_core", "install_core", "check_official",
 		"restart", "stop", "rollback", "autostart":
 		if d.busy.Load() && action.Kind != "close_orca" {
 			return errors.New("Orca 正忙，请稍后再试")
@@ -325,7 +333,7 @@ func (d *desktop) runPanelAction(p *trayPanel, action panelAction) error {
 			return errors.New("此应用的内核随应用更新")
 		}
 		if action.Kind == "open_paired" {
-			go d.closePanel(p)
+			dismiss()
 		}
 		d.request(action.Kind, nil)
 	case "config", "logs", "data":
@@ -334,6 +342,29 @@ func (d *desktop) runPanelAction(p *trayPanel, action panelAction) error {
 		d.quit()
 	default:
 		return fmt.Errorf("未知托盘操作 %q", strings.ToValidUTF8(action.Kind, ""))
+	}
+	return nil
+}
+
+func (d *desktop) trayTaskTarget(id string) *tasks.Target {
+	if id == "" {
+		return nil
+	}
+	status := d.core.Status()
+	d.statusMu.RLock()
+	defer d.statusMu.RUnlock()
+	if status.Phase != "running" || status.PID != d.taskPID || d.taskSummary == nil {
+		return nil
+	}
+	return taskTargetInSummary(d.taskSummary, id)
+}
+
+func taskTargetInSummary(summary *tasks.Summary, id string) *tasks.Target {
+	for _, row := range summary.Rows {
+		if row.ID == id {
+			target := row.Target
+			return &target
+		}
 	}
 	return nil
 }

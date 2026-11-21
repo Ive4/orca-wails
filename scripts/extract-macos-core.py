@@ -15,9 +15,30 @@ import tarfile
 import tempfile
 import zipfile
 
-ROOT = Path(__file__).resolve().parent.parent
+from upstream_cache import ROOT, cache_dir, fetch_pinned, fetch_source, file_digest
+
+VERSION_FILE = ROOT / 'core-version.macos-arm64.json'
 INVENTORY_SOURCE = 'src/shared/remote-runtime/orcad-distribution/orcad-artifacts.ts'
 SQLITE_MIN_MACOS = '13.5'
+DATA_PLUGIN_BUNDLE = r"""
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import {
+  buildOrcadEntry, buildOrcadWorker, ORCAD_CHILD_ENTRY_POINTS, orcadChildOutputFilename,
+} from './config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs';
+
+const server = process.argv[1];
+const slot = dirname(server);
+const workers = Object.values(ORCAD_CHILD_ENTRY_POINTS)
+  .map(entry => [entry, orcadChildOutputFilename(entry)])
+  .filter(([, filename]) => !existsSync(join(slot, filename)));
+workers.push(['src/main/plugins/workers/plugin-host-entry.ts', 'plugin-host-entry.js']);
+await Promise.all([
+  buildOrcadEntry(server),
+  ...workers.map(([entry, filename]) => buildOrcadWorker(entry, join(slot, filename))),
+]);
+process.stdout.write(JSON.stringify(workers.map(([, filename]) => filename).sort()));
+"""
 SLOT_VERSION = r"""
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const inventory = require(process.argv[1]), slot = process.argv[2], browser = process.argv[3];
@@ -49,16 +70,8 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def check_hash(path, expected):
-    require(sha256(path) == expected, f'SHA-256 mismatch for {path.name}')
+    require(file_digest(path) == expected, f'SHA-256 mismatch for {path.name}')
 
 
 def safe_path(root, relative):
@@ -77,26 +90,14 @@ def copy_resource(source, destination, digest=None):
     shutil.copy2(source, destination)
 
 
-def download(url, destination, digest=None, timeout=180):
-    cache = os.environ.get('ORCA_CORE_DOWNLOAD_CACHE')
-    if cache and digest:
-        cached = Path(cache) / digest
-        if cached.is_file():
-            copy_resource(cached, destination, digest)
-            return
-    subprocess.run(['/usr/bin/curl', '-fsSL', '--retry', '2', '--connect-timeout', '10', '--max-time', str(timeout),
-                    url, '-o', destination], check=True)
-    if digest is not None:
-        check_hash(destination, digest)
-
-
-def stage_bun(lock, work, stage, bun_archive, sqlite_archive):
+def stage_bun(lock, work, stage, bun_archive, sqlite_archive, cache):
     pin = lock['bun']
     version = pin['version']
     if bun_archive is None:
-        bun_archive = work / 'bun.tgz'
-        download(f'https://registry.npmjs.org/@oven/bun-darwin-aarch64/-/bun-darwin-aarch64-{version}.tgz',
-                 bun_archive, pin['archive_sha256'])
+        bun_archive = fetch_pinned(
+            f'https://registry.npmjs.org/@oven/bun-darwin-aarch64/-/bun-darwin-aarch64-{version}.tgz',
+            pin['archive_sha256'], cache,
+        )
     else:
         check_hash(bun_archive, pin['archive_sha256'])
     bun = stage / f'runtimes/bun-{version}/bun'
@@ -106,17 +107,19 @@ def stage_bun(lock, work, stage, bun_archive, sqlite_archive):
             shutil.copyfileobj(source, output)
     check_hash(bun, pin['executable_sha256'])
     bun.chmod(0o755)
-    download(f'https://raw.githubusercontent.com/oven-sh/bun/bun-v{version}/LICENSE.md',
-             stage / 'licenses/BUN-LICENSE', pin['license_sha256'])
+    license_file = fetch_pinned(f'https://raw.githubusercontent.com/oven-sh/bun/bun-v{version}/LICENSE.md',
+                                pin['license_sha256'], cache)
+    copy_resource(license_file, stage / 'licenses/BUN-LICENSE')
 
     sqlite_pin = lock['sqlite']
     major, minor, patch = map(int, sqlite_pin['version'].split('.'))
     name = f'sqlite-amalgamation-{major * 1000000 + minor * 10000 + patch * 100}'
     if sqlite_archive is None:
-        sqlite_archive = work / 'sqlite.zip'
-        download(f'https://sqlite.org/2026/{name}.zip', sqlite_archive)
-    require(hashlib.sha3_256(sqlite_archive.read_bytes()).hexdigest() == sqlite_pin['archive_sha3_256'],
-            'SHA3-256 mismatch for SQLite amalgamation')
+        sqlite_archive = fetch_pinned(f'https://sqlite.org/2026/{name}.zip', sqlite_pin['archive_sha3_256'],
+                                      cache, algorithm='sha3_256')
+    else:
+        require(file_digest(sqlite_archive, 'sha3_256') == sqlite_pin['archive_sha3_256'],
+                'SHA3-256 mismatch for SQLite amalgamation')
     with zipfile.ZipFile(sqlite_archive) as archive:
         source = work / 'sqlite3.c'
         source.write_bytes(archive.read(f'{name}/sqlite3.c'))
@@ -136,9 +139,7 @@ def stage_bun(lock, work, stage, bun_archive, sqlite_archive):
 def build_data_plugin_core(args, upstream, work, stage):
     source_archive = args.upstream_source_archive
     if source_archive is None:
-        source_archive = work / 'orca-source.tar.gz'
-        download(f'https://codeload.github.com/stablyai/orca/tar.gz/{upstream["commit"]}',
-                 source_archive, upstream['source_archive_sha256'])
+        source_archive = fetch_source(upstream['commit'], args.cache, upstream['source_archive_sha256'])
     else:
         check_hash(source_archive, upstream['source_archive_sha256'])
 
@@ -147,12 +148,20 @@ def build_data_plugin_core(args, upstream, work, stage):
     # The archive was pinned in full before unpacking. Edits go into a disposable directory.
     subprocess.run(['/usr/bin/tar', '-xzf', source_archive, '--strip-components=1', '-C', checkout],
                    check=True, timeout=90)
+    copy_resource(checkout / INVENTORY_SOURCE, work / 'orcad-artifacts.ts', upstream['artifact_source_sha256'])
+    copy_resource(checkout / 'LICENSE', stage / 'licenses/ORCA-LICENSE', upstream['license_sha256'])
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('ELECTRON_', 'ORCA_', 'NODE_', 'BUN_', 'GIT_'))}
-    subprocess.run(['/usr/bin/git', 'apply', '--whitespace=error-all',
-                    ROOT / 'scripts/macos-data-plugins.patch'],
-                   cwd=checkout, env={**env, 'GIT_CEILING_DIRECTORIES': str(work)},
-                   check=True, timeout=30)
+    # The local runtime patch builds on the data-plugin settings navigation.
+    for name in (
+        'macos-data-plugins.patch',
+        'macos-tab-drag.patch',
+        'macos-local-runtime.patch',
+        'macos-plugin-catalog.patch',
+    ):
+        subprocess.run(['/usr/bin/git', 'apply', '--whitespace=error-all', ROOT / 'scripts' / name],
+                       cwd=checkout, env={**env, 'GIT_CEILING_DIRECTORIES': str(work)},
+                       check=True, timeout=30)
     env['ORCA_TAURI_SOURCE_COMMIT'] = upstream['commit']
     # Just upstream’s locked dependencies. Native runtime binaries come from the signed app.
     pnpm = ['npm', 'exec', '--yes', '--package=pnpm@12.14.0', '--', 'pnpm']
@@ -160,12 +169,9 @@ def build_data_plugin_core(args, upstream, work, stage):
                    cwd=checkout, env=env, check=True, timeout=1200)
     subprocess.run([*pnpm, 'run', 'build:web'], cwd=checkout, env=env, check=True, timeout=300)
     server = stage / 'orcad/orcad-server.js'
-    plugin_host = server.with_name('plugin-host-entry.js')
-    subprocess.run(['node', '--input-type=module', '-e',
-                    'import { buildOrcadEntry, buildOrcadPluginHost } from "./config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs"; '
-                    'await Promise.all([buildOrcadEntry(process.argv[1]), buildOrcadPluginHost(process.argv[2])])',
-                    server, plugin_host], cwd=checkout, env=env,
-                   check=True, timeout=180)
+    workers = json.loads(subprocess.check_output(
+        ['node', '--input-type=module', '-e', DATA_PLUGIN_BUNDLE, server],
+        cwd=checkout, env=env, timeout=180))
 
     # The separately served Web files must participate in the derived slot identity too.
     digest = hashlib.sha256()
@@ -174,11 +180,12 @@ def build_data_plugin_core(args, upstream, work, stage):
     for file in sorted(web.rglob('*')):
         if file.is_file():
             relative = file.relative_to(web).as_posix()
-            digest.update(relative.encode() + b'\0' + bytes.fromhex(sha256(file)))
+            digest.update(relative.encode() + b'\0' + bytes.fromhex(file_digest(file)))
             copy_resource(file, safe_path(stage / 'web', relative))
     with server.open('a') as bundled:
         bundled.write(f'\n/* Orca Tauri Web SHA-256 {digest.hexdigest()} */\n')
-        bundled.write(f'/* Orca plugin worker SHA-256 {sha256(plugin_host)} */\n')
+        for filename in workers:
+            bundled.write(f'/* Orca worker {filename} SHA-256 {file_digest(server.with_name(filename))} */\n')
 
 
 def adapt_bun_slot(slot, runtime, lock, verifier):
@@ -189,7 +196,7 @@ def adapt_bun_slot(slot, runtime, lock, verifier):
     sqlite_relative = relative + '/libsqlite3.dylib'
     # Include the native runtime inputs in the slot content identity.
     prefix = (
-        f'/* Bun {lock["bun"]["executable_sha256"]}, SQLite {sha256(runtime.with_name("libsqlite3.dylib"))} */\n'
+        f'/* Bun {lock["bun"]["executable_sha256"]}, SQLite {file_digest(runtime.with_name("libsqlite3.dylib"))} */\n'
         'require("bun:sqlite").Database.setCustomSQLite('
         f'require("node:path").join(__dirname,{json.dumps(sqlite_relative)}));\n'
     )
@@ -244,20 +251,15 @@ def stage_core(args, lock, work, stage):
     require('web-index.html' in web_files, 'Missing browser entry in upstream inventory')
     build_data_plugin_core(args, upstream, work, stage)
 
-    licenses = stage / 'licenses'
-    licenses.mkdir()
     require((slot / '.runtime-node').read_text().strip() == upstream['node_executable_sha256'] and
             (slot / '.server-target').read_text().strip() == target,
             'Official Orcad slot does not match the upstream runtime pin or target')
 
     verifier = runpy.run_path(str(ROOT / 'scripts/verify-bun-macos.py'))
-    runtime = stage_bun(lock, work, stage, args.bun_archive, args.sqlite_archive)
+    runtime = stage_bun(lock, work, stage, args.bun_archive, args.sqlite_archive, args.cache)
     adapt_bun_slot(slot, runtime, lock, verifier)
 
-    base = f'https://raw.githubusercontent.com/stablyai/orca/{upstream["commit"]}'
     source = work / 'orcad-artifacts.ts'
-    download(f'{base}/{INVENTORY_SOURCE}', source, upstream['artifact_source_sha256'])
-    download(f'{base}/LICENSE', licenses / 'ORCA-LICENSE', upstream['license_sha256'])
     env = {k: v for k, v in os.environ.items() if not k.startswith(('ELECTRON_', 'ORCA_', 'NODE_', 'BUN_'))}
     runtime_env = {'BUN_OPTIONS': '--no-env-file', 'DO_NOT_TRACK': '1'}
     env.update(runtime_env)
@@ -287,7 +289,7 @@ def stage_core(args, lock, work, stage):
         'bun_sha256': lock['bun']['executable_sha256'],
     }
     (stage / 'core-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    copy_resource(ROOT / 'core-version.macos-arm64.json', stage / 'upstream-lock.json')
+    (stage / 'upstream-lock.json').write_text(json.dumps(lock, indent=2) + '\n')
     profile = work / 'boot-profile'
     profile.mkdir(mode=0o700)
     verifier['verify_start'](runtime, stage, manifest, profile)
@@ -302,11 +304,13 @@ def main():
     parser.add_argument('--upstream-source-archive', type=Path)
     parser.add_argument('--bun-archive', type=Path)
     parser.add_argument('--sqlite-archive', type=Path)
+    parser.add_argument('--version-file', type=Path, default=VERSION_FILE)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    args.cache = cache_dir()
 
     require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'Use an Apple Silicon Mac')
-    lock = json.loads((ROOT / 'core-version.macos-arm64.json').read_text())
+    lock = json.loads(args.version_file.read_text())
     stable = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
     require(re.fullmatch(f'v{stable}', lock['version'])
             and re.fullmatch(stable, lock['package_revision'])
@@ -317,9 +321,10 @@ def main():
         work = Path(directory)
         if args.download_orca:
             upstream = lock['upstream']
-            archive = work / 'upstream.zip'
-            download(f'https://github.com/stablyai/orca/releases/download/{lock["version"]}/{upstream["archive"]}',
-                     archive, upstream['archive_sha256'], timeout=600)
+            archive = fetch_pinned(
+                f'https://github.com/stablyai/orca/releases/download/{lock["version"]}/{upstream["archive"]}',
+                upstream['archive_sha256'], args.cache, timeout=900,
+            )
             unpacked = work / 'official-app'
             subprocess.run(['/usr/bin/ditto', '-x', '-k', archive, unpacked], check=True)
             args.orca_app = unpacked / 'Orca.app'
@@ -333,7 +338,7 @@ def main():
                     bundle.write(path, path.relative_to(stage).as_posix())
         seed = work / 'bootstrap-core.json'
         identity = {key: lock[key] for key in ('version', 'package_revision', 'target')}
-        identity['sha256'] = sha256(archive)
+        identity['sha256'] = file_digest(archive)
         seed.write_text(json.dumps(identity, indent=2) + '\n')
         checksum = archive.with_suffix('.zip.sha256')
         checksum.write_text(f"{identity['sha256']}  {archive.name}\n")

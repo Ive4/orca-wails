@@ -1,0 +1,177 @@
+diff --git a/src/renderer/src/components/tab-bar/strip/tab-strip-pointer-activation.ts b/src/renderer/src/components/tab-bar/strip/tab-strip-pointer-activation.ts
+--- a/src/renderer/src/components/tab-bar/strip/tab-strip-pointer-activation.ts
++++ b/src/renderer/src/components/tab-bar/strip/tab-strip-pointer-activation.ts
+@@ -1,5 +1,5 @@
+ import { useCallback, useEffect, useRef } from 'react'
+-import { TAB_DRAG_ACTIVATION_DISTANCE_PX } from '../../tab-group/drag/useTabDragSplit'
++import { TAB_DRAG_ACTIVATION_DISTANCE_PX } from '../../tab-group/drag/tab-drag-pointer-sensor'
+ import { beginTabStripPointerGesture } from './tab-strip-pointer-gesture'
+ import { isAgentInputMovingFocus } from '../../browser-pane/host-guest/input/agent-input-focus-guard'
+ 
+@@ -56,7 +56,7 @@
+       }
+       const onPointerUp = (upEvent: PointerEvent): void => {
+         const wasDrag =
+-          Math.hypot(upEvent.clientX - startX, upEvent.clientY - startY) >=
++          Math.hypot(upEvent.clientX - startX, upEvent.clientY - startY) >
+           TAB_DRAG_ACTIVATION_DISTANCE_PX
+         cleanup()
+         // Use final release coordinates because packaged Chromium can deliver a stale first move after focus.
+diff --git a/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.test.tsx b/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.test.tsx
+@@ -0,0 +1,88 @@
++// @vitest-environment happy-dom
++
++import { DndContext, useDraggable, useSensor } from '@dnd-kit/core'
++import { cleanup, fireEvent, render, screen } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
++import { useTabStripPointerActivation } from '../../tab-bar/strip/tab-strip-pointer-activation'
++import { TAB_DRAG_ACTIVATION_DISTANCE_PX, TabDragPointerSensor } from './tab-drag-pointer-sensor'
++
++function Tab({ onActivate }: { onActivate: () => void }): React.JSX.Element {
++  const { attributes, listeners, setNodeRef } = useDraggable({ id: 'tab' })
++  const { onPointerDown } = useTabStripPointerActivation({ onActivate })
++  return (
++    <button
++      type="button"
++      ref={setNodeRef}
++      {...attributes}
++      onPointerDown={(event) => onPointerDown(event, listeners?.onPointerDown)}
++    >
++      Tab
++    </button>
++  )
++}
++
++function pressTab() {
++  const onActivate = vi.fn()
++  const onDragStart = vi.fn()
++  const onDragEnd = vi.fn()
++  function App(): React.JSX.Element {
++    const sensor = useSensor(TabDragPointerSensor, {
++      activationConstraint: { distance: TAB_DRAG_ACTIVATION_DISTANCE_PX }
++    })
++    return (
++      <DndContext sensors={[sensor]} onDragStart={onDragStart} onDragEnd={onDragEnd}>
++        <Tab onActivate={onActivate} />
++      </DndContext>
++    )
++  }
++
++  render(<App />)
++  fireEvent.pointerDown(screen.getByRole('button', { name: 'Tab' }), {
++    buttons: 1,
++    pointerId: 1,
++    isPrimary: true
++  })
++  return { onActivate, onDragStart, onDragEnd }
++}
++
++function movePointer(clientX: number, buttons: number, pointerId = 1): void {
++  fireEvent.pointerMove(document, { clientX, buttons, pointerId, isPrimary: true })
++}
++
++afterEach(() => {
++  fireEvent.pointerCancel(document, { pointerId: 1 })
++  cleanup()
++})
++
++it('selects the tab when the pointer slips a few pixels during a click', () => {
++  const { onActivate, onDragStart } = pressTab()
++  movePointer(14, 1)
++  movePointer(18, 1)
++  fireEvent.pointerUp(document, { clientX: 18, pointerId: 1, button: 0 })
++  expect(onDragStart).not.toHaveBeenCalled()
++  expect(onActivate).toHaveBeenCalledOnce()
++})
++
++it('does not start a drag from hover after a missed release', () => {
++  const { onDragStart } = pressTab()
++  movePointer(35, 0)
++  movePointer(45, 0)
++  expect(onDragStart).not.toHaveBeenCalled()
++})
++
++it('ignores movement from a pointer that did not press the tab', () => {
++  const { onDragStart } = pressTab()
++  movePointer(35, 1, 2)
++  movePointer(45, 1, 2)
++  expect(onDragStart).not.toHaveBeenCalled()
++})
++
++it('starts and finishes a deliberate drag with the primary button held', () => {
++  const { onActivate, onDragStart, onDragEnd } = pressTab()
++  movePointer(35, 1)
++  movePointer(45, 1)
++  fireEvent.pointerUp(document, { clientX: 45, pointerId: 1, button: 0 })
++  expect(onDragStart).toHaveBeenCalledOnce()
++  expect(onDragEnd).toHaveBeenCalledOnce()
++  expect(onActivate).not.toHaveBeenCalled()
++})
+diff --git a/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.ts b/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.ts
+--- a/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.ts
++++ b/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.ts
+@@ -8,6 +8,9 @@
+   SensorProps
+ } from '@dnd-kit/core'
+ import { recordTabDragPointer } from './tab-drag-pointer'
++
++// Allow click jitter because tab activation waits until pointerup.
++export const TAB_DRAG_ACTIVATION_DISTANCE_PX = 18
+ 
+ type PointerCoordinates = { x: number; y: number }
+ 
+@@ -143,6 +146,7 @@
+   private ended = false
+   private readonly document: Document
+   private readonly initialCoordinates: PointerCoordinates
++  private readonly pointerId: number
+   private readonly pointerDownTime = performance.now()
+   private readonly props: SensorProps<PointerSensorOptions>
+   private readonly documentListeners = new ListenerBag()
+@@ -153,6 +157,7 @@
+ 
+   constructor(props: SensorProps<PointerSensorOptions>) {
+     this.props = props
++    this.pointerId = (props.event as PointerEvent).pointerId
+     this.document = getOwnerDocument(props.event.target)
+     const pointerDownCoordinates = getPointerCoordinates(props.event)
+     this.initialCoordinates = pointerDownCoordinates ?? DEFAULT_COORDINATES
+@@ -234,7 +239,12 @@
+   }
+ 
+   private handleMove(event: PointerEvent): void {
+-    if (this.ended) {
++    if (this.ended || event.pointerId !== this.pointerId) {
++      return
++    }
++    // A missed release can leave this sensor listening when the pointer is only hovering.
++    if ((event.buttons & 1) === 0) {
++      this.handleCancel()
+       return
+     }
+     const coordinates = getPointerCoordinates(event)
+diff --git a/src/renderer/src/components/tab-group/drag/useTabDragSplit.ts b/src/renderer/src/components/tab-group/drag/useTabDragSplit.ts
+--- a/src/renderer/src/components/tab-group/drag/useTabDragSplit.ts
++++ b/src/renderer/src/components/tab-group/drag/useTabDragSplit.ts
+@@ -15,7 +15,7 @@
+ import { useHoveredTabInsertion, type HoveredTabInsertion } from './tab-insertion'
+ import { captureTabDragActivationSnapshot } from './tab-drag-preview-activation'
+ import { getDragPointer } from './tab-drag-pointer'
+-import { TabDragPointerSensor } from './tab-drag-pointer-sensor'
++import { TAB_DRAG_ACTIVATION_DISTANCE_PX, TabDragPointerSensor } from './tab-drag-pointer-sensor'
+ import {
+   captureTabGroupPanelGeometrySnapshot,
+   type TabGroupPanelGeometrySnapshot
+@@ -25,9 +25,6 @@
+ import { useTabDragHoverPreview, type HoveredTabDropTarget } from './tab-drag-hover-preview'
+ import { commitTabDragDrop } from './tab-drag-drop-commit'
+ import { resolveTabDragCollisions } from './tab-drag-collision'
+-
+-// Allow click jitter because tab activation waits until pointerup.
+-export const TAB_DRAG_ACTIVATION_DISTANCE_PX = 12
+ 
+ export function canDropTabForPaneColumnSplit(args: {
+   activeDrag: TabDragItemData | null

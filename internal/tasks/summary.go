@@ -60,6 +60,8 @@ func parseResponse(raw []byte, runtimeID string) (Summary, error) {
 				StartedAt: agent.stateStartedAt,
 				UpdatedAt: agent.updatedAt,
 				Target:    target,
+				QuickReply: rowStatus(agent) == Waiting && target.StructuredSessionID() != "" &&
+					(worktree.hostID == nil || *worktree.hostID == "local" || *worktree.hostID == "runtime:"+runtimeID),
 			})
 		}
 	}

@@ -1,19 +1,19 @@
 {
   "schema_version": 1,
-  "version": "v1.4.266",
+  "version": "v1.4.267",
   "package_revision": "0.0.1",
   "target": "x86_64-pc-windows-msvc",
   "upstream_target": "win32-x64",
   "validation": {
     "status": "archive-verified-awaiting-windows-smoke",
-    "audited_on": "2026-11-20",
-    "note": "Official installer bytes, NSIS layout, 433 slot file hashes and 1513 browser assets were checked without executing the core. Windows runtime, PTY, Job and WebView qualification must still pass in CI/on Windows 11."
+    "audited_on": "2026-11-21",
+    "note": "Official installer bytes, NSIS layout, 433 slot file hashes and 1515 browser assets were checked without executing the core. Windows runtime, PTY, Job and WebView qualification must still pass in CI/on Windows 11."
   },
   "upstream": {
     "repository": "stablyai/orca",
-    "commit": "903c91e80fbe7bbcaffe6ac767c49eac91e98a64",
+    "commit": "baf9c2c328fa95c0ba9c25fda4836b479162d232",
     "asset": "orca-windows-setup.exe",
-    "sha256": "a5e2f21f3e839900624a828c53c3783d5c8d2ccf90ef94f404021d3951e57e18"
+    "sha256": "1c3714c7e66703e7a2c8fcb8eb7479423be380c5e847db870025ce5a5150f27e"
   },
   "node": {
     "version": "24.22.1",

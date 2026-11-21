@@ -24,6 +24,8 @@ jobs:
           for script in scripts/test-*.mjs; do node "$script" || exit; done
           node --check assets/tray/panel.js
       - if: runner.os == 'macOS'
-        run: scripts/build-macos.sh --no-core
+        run: |
+          python3 scripts/test-follow-orca.py
+          scripts/build-macos.sh --no-core
       - if: runner.os == 'Windows'
         run: scripts/build-windows.ps1

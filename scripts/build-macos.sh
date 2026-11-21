@@ -19,6 +19,18 @@ public_key="${ORCA_WAILS_UPDATE_PUBLIC_KEY:-}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 [[ "$public_key" =~ ^[A-Za-z0-9+/=]*$ ]]
 
+identity="${ORCA_WAILS_SIGN_IDENTITY:-}"
+signing_options=(--options runtime --timestamp)
+local_identity="$HOME/Library/Application Support/Orca-Wails/signing-identity"
+if [[ -z "$identity" && "$bundle_id" == dev.orca-wails.desktop && -f "$local_identity" ]]; then
+  identity="$(cat "$local_identity")"
+  if [[ ! "$identity" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    printf 'Invalid code signing certificate fingerprint in %s\n' "$local_identity" >&2
+    exit 1
+  fi
+  signing_options=(--timestamp=none)
+fi
+
 seed=
 case "${1:-}" in
   --archive)
@@ -53,13 +65,17 @@ fi
 
 export MACOSX_DEPLOYMENT_TARGET=13.5
 export CGO_CFLAGS="${CGO_CFLAGS:--O2 -g} -mmacosx-version-min=13.5"
-CGO_ENABLED=1 go build -tags production -trimpath -ldflags="-s -w -extldflags=-mmacosx-version-min=13.5 -X main.version=$version -X main.instanceID=$bundle_id -X main.appUpdatePublicKey=$public_key" \
+swift_archive="$(pwd)/$stage/libOrcaTray.a"
+xcrun swiftc -emit-library -static -O -whole-module-optimization -module-name OrcaTray \
+  -swift-version 6 -target arm64-apple-macosx13.5 -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+  native/macos/*.swift -o "$swift_archive"
+export CGO_LDFLAGS="${CGO_LDFLAGS:-} $swift_archive"
+CGO_ENABLED=1 go build -tags production,swifttray -trimpath -ldflags="-s -w -extldflags '-mmacosx-version-min=13.5 -Wl,-rpath,/usr/lib/swift' -X main.version=$version -X main.instanceID=$bundle_id -X main.appUpdatePublicKey=$public_key" \
   -o "$bundle/Contents/MacOS/orca-wails" .
-identity="${ORCA_WAILS_SIGN_IDENTITY:--}"
-if [[ "$identity" == - ]]; then
+if [[ "${identity:--}" == - ]]; then
   codesign --force --sign - "$bundle"
 else
-  codesign --force --sign "$identity" --options runtime --timestamp "$bundle"
+  codesign --force --sign "$identity" "${signing_options[@]}" "$bundle"
 fi
 codesign --verify --strict "$bundle"
 rm -rf "$app"

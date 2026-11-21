@@ -50,7 +50,7 @@ func validatedOffer(offer string, port uint16) (*url.URL, error) {
 	return u, nil
 }
 
-func (d *desktop) showOrca(paired bool, target *tasks.Target) error {
+func (d *desktop) showOrca(paired bool, target *tasks.Target, action string) error {
 	offer, port, ok := d.core.Offer()
 	if !ok {
 		return errors.New("内核没有提供可用的配对信息，请查看日志或重启内核")
@@ -66,7 +66,9 @@ func (d *desktop) showOrca(paired bool, target *tasks.Target) error {
 		title = "Orca · 已配对服务器"
 	}
 	var reveal string
-	if target != nil && target.WorktreeID != "" && target.TabID != "" {
+	if action == "open_bots" {
+		reveal = "window.__orcaTrayOpenBots?.();"
+	} else if target != nil && target.WorktreeID != "" && target.TabID != "" {
 		value, err := json.Marshal(target)
 		if err != nil {
 			return err
@@ -96,9 +98,10 @@ func (d *desktop) showOrca(paired bool, target *tasks.Target) error {
 		host := u.Host
 		originJSON, _ := json.Marshal("http://" + host)
 		script := "(() => { if (window.top !== window || location.origin !== " + string(originJSON) + ") return;\n" +
-			themeScript + "\n" + botsScript + "(\n" + botsDictionary + "\n);\n"
+			themeScript + "\n" + botsScript + "(\n" + botsDictionary + "\n);\n" + botAvatarScript()
 		if !paired {
-			script += pairingScript + "\n" + revealScript + "\n" + reveal + "\n"
+			fragment, _ := json.Marshal(u.EscapedFragment())
+			script += pairingScript + "(" + string(fragment) + ");\n" + revealScript + "\n" + reveal + "\n"
 		}
 		script += "})();"
 
@@ -122,6 +125,7 @@ func (d *desktop) showOrca(paired bool, target *tasks.Target) error {
 				}
 				setDockVisible(true)
 				w.win.Show().Focus()
+				go d.refreshNativeTray(false)
 				if w.pendingReveal != "" {
 					evalOrca(w.win, w.pendingReveal)
 					w.pendingReveal = ""
@@ -140,6 +144,8 @@ func (d *desktop) showOrca(paired bool, target *tasks.Target) error {
 				if d.window.Load() == w && !w.ready.Load() {
 					d.closeOrca()
 					d.setMessage("Orca 窗口加载超时")
+					d.showNativeManagement()
+					go d.refreshNativeTray(false)
 				}
 			})
 		})

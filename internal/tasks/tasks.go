@@ -27,20 +27,22 @@ type Summary struct {
 }
 
 type Row struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Workspace string  `json:"workspace"`
-	Provider  *string `json:"provider"`
-	Status    Status  `json:"status"`
-	StartedAt *uint64 `json:"startedAt"`
-	UpdatedAt *uint64 `json:"updatedAt"`
-	Target    Target  `json:"-"`
+	ID         string  `json:"id"`
+	Title      string  `json:"title"`
+	Workspace  string  `json:"workspace"`
+	Provider   *string `json:"provider"`
+	Status     Status  `json:"status"`
+	StartedAt  *uint64 `json:"startedAt"`
+	UpdatedAt  *uint64 `json:"updatedAt"`
+	Target     Target  `json:"-"`
+	QuickReply bool    `json:"quickReply,omitempty"`
 }
 
 type Target struct {
-	WorktreeID string  `json:"worktreeId"`
-	TabID      string  `json:"tabId"`
-	LeafID     *string `json:"leafId"`
+	WorktreeID    string  `json:"worktreeId"`
+	TabID         string  `json:"tabId"`
+	LeafID        *string `json:"leafId"`
+	FocusComposer bool    `json:"focusComposer,omitempty"`
 }
 
 type Status string
@@ -67,6 +69,17 @@ func Read(ctx context.Context, data string, pid uint32) (summary Summary, err er
 		return Summary{}, err
 	}
 
+	metadata, err := runtimeFor(ctx, data, pid)
+	if err != nil {
+		return Summary{}, err
+	}
+	return readSummary(ctx, metadata)
+}
+
+func runtimeFor(ctx context.Context, data string, pid uint32) (runtimeMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return runtimeMetadata{}, err
+	}
 	// Regular file I/O can block beyond the request deadline.
 	type metadataResult struct {
 		metadata runtimeMetadata
@@ -79,12 +92,9 @@ func Read(ctx context.Context, data string, pid uint32) (summary Summary, err er
 	}()
 	select {
 	case <-ctx.Done():
-		return Summary{}, ctx.Err()
+		return runtimeMetadata{}, ctx.Err()
 	case result := <-ready:
-		if result.err != nil {
-			return Summary{}, result.err
-		}
-		return readSummary(ctx, result.metadata)
+		return result.metadata, result.err
 	}
 }
 
@@ -127,41 +137,47 @@ func readMetadata(data string, pid uint32) (runtimeMetadata, error) {
 }
 
 func readSummary(ctx context.Context, metadata runtimeMetadata) (Summary, error) {
-	stream, err := connectOwned(ctx, metadata)
+	line, err := runtimeRequest(ctx, metadata, requestID, "worktree.ps", struct {
+		Limit                                    int  `json:"limit"`
+		SupportsWorktreeVisibilitySourceDefaults bool `json:"supportsWorktreeVisibilitySourceDefaults"`
+	}{256, true})
 	if err != nil {
 		return Summary{}, err
+	}
+	return parseResponse(line, metadata.runtimeID)
+}
+
+func runtimeRequest(ctx context.Context, metadata runtimeMetadata, id, method string, params any) ([]byte, error) {
+	stream, err := connectOwned(ctx, metadata)
+	if err != nil {
+		return nil, err
 	}
 	closeStream := sync.OnceFunc(func() { _ = stream.Close() })
 	defer closeStream()
 	stop := context.AfterFunc(ctx, closeStream)
 	defer stop()
 	if err := ctx.Err(); err != nil {
-		return Summary{}, err
+		return nil, err
 	}
 
 	request := struct {
 		ID        string `json:"id"`
 		AuthToken string `json:"authToken"`
 		Method    string `json:"method"`
-		Params    struct {
-			Limit                                    int  `json:"limit"`
-			SupportsWorktreeVisibilitySourceDefaults bool `json:"supportsWorktreeVisibilitySourceDefaults"`
-		} `json:"params"`
-	}{ID: requestID, AuthToken: metadata.authToken, Method: "worktree.ps"}
-	request.Params.Limit = 256
-	request.Params.SupportsWorktreeVisibilitySourceDefaults = true
+		Params    any    `json:"params"`
+	}{id, metadata.authToken, method, params}
 	if err := json.NewEncoder(stream).Encode(request); err != nil {
-		return Summary{}, err
+		return nil, err
 	}
 
 	line, err := bufio.NewReader(io.LimitReader(stream, responseLimit)).ReadBytes('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		return Summary{}, err
+		return nil, err
 	}
 	if !bytes.HasSuffix(line, []byte{'\n'}) {
-		return Summary{}, errors.New("incomplete Orca response")
+		return nil, errors.New("incomplete Orca response")
 	}
-	return parseResponse(line, metadata.runtimeID)
+	return line, nil
 }
 
 func (m runtimeMetadata) endpoint(kind string) (string, bool) {

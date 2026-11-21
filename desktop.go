@@ -23,13 +23,57 @@ func (d *desktop) setMessage(message string) {
 	d.statusMu.Unlock()
 }
 
-func (d *desktop) notify(message string) {
-	if d.cfg.Notifications {
-		notifyDesktop(message)
+func (d *desktop) notificationsEnabled() bool {
+	d.statusMu.RLock()
+	defer d.statusMu.RUnlock()
+	return d.notifications
+}
+
+func (d *desktop) setMacOSEntry(action string) error {
+	d.settingsMu.Lock()
+	defer d.settingsMu.Unlock()
+	cfg, _, err := loadConfig(d.paths.root)
+	if err != nil {
+		return err
 	}
+	if action == "menu_bar_on" || action == "menu_bar_off" {
+		cfg.MacOSEntries.MenuBar = action == "menu_bar_on"
+	} else {
+		cfg.MacOSEntries.Notch = action == "notch_on"
+	}
+	if err := saveConfig(cfg, d.paths.settings); err != nil {
+		return err
+	}
+	d.statusMu.Lock()
+	d.entries = cfg.MacOSEntries
+	d.message = "入口设置已保存"
+	d.statusMu.Unlock()
+	return nil
+}
+
+func (d *desktop) notify(message string) {
+	if !d.notificationsEnabled() || d.quitting.Load() {
+		return
+	}
+	if d.nativeTray {
+		d.sendNativeNotice(trayNotice{Title: appName, Body: message, Group: "orca.general"})
+		return
+	}
+	notifyDesktop(message)
+}
+
+type desktopRequest struct {
+	action         string
+	task           *tasks.Target
+	notificationID string
 }
 
 func (d *desktop) request(action string, task *tasks.Target) {
+	d.dispatchRequest(desktopRequest{action: action, task: task})
+}
+
+func (d *desktop) dispatchRequest(request desktopRequest) {
+	action, task := request.action, request.task
 	if d.quitting.Load() {
 		return
 	}
@@ -38,36 +82,61 @@ func (d *desktop) request(action string, task *tasks.Target) {
 		case "close_orca", "toggle":
 			go d.closeOrca()
 			return
-		case "open":
+		case "open", "open_bots":
 			if w := d.window.Load(); w != nil && !w.paired {
-				go func() { _ = d.showOrca(false, task) }()
+				go func() { _ = d.showOrca(false, task, action) }()
 				return
 			}
 		}
 	}
 	if !d.busy.CompareAndSwap(false, true) {
-		if action == "open" || action == "toggle" {
-			d.pending.Store(true)
+		switch action {
+		case "open", "toggle":
+			open := &desktopRequest{action: "open", task: task}
+			if task != nil {
+				d.pending.Store(open)
+			} else {
+				d.pending.CompareAndSwap(nil, open)
+			}
+		case "open_bots", "open_notification":
+			d.pending.Store(&request)
 		}
+		d.openPending()
 		return
 	}
 	go func() {
+		d.refreshNativeTray(false)
 		d.operation.Lock()
 		if !d.quitting.Load() {
-			if err := d.execute(action, task); err != nil && !d.quitting.Load() {
+			if err := d.execute(request); err != nil && !d.quitting.Load() {
 				d.setMessage(err.Error())
 				d.notify(err.Error())
+				switch action {
+				case "open", "open_paired", "open_bots", "open_notification", "toggle":
+					if d.window.Load() == nil {
+						d.showNativeManagement()
+					}
+				}
 			}
 		}
 		d.operation.Unlock()
 		d.busy.Store(false)
-		if d.pending.Swap(false) {
-			d.request("open", nil)
-		}
+		d.refreshNativeTray(true)
+		d.openPending()
 	}()
 }
 
-func (d *desktop) execute(action string, task *tasks.Target) error {
+func (d *desktop) openPending() {
+	if d.busy.Load() {
+		return
+	}
+	if action := d.pending.Swap(nil); action != nil {
+		d.dispatchRequest(*action)
+	}
+}
+
+func (d *desktop) execute(request desktopRequest) error {
+	action, task := request.action, request.task
 	switch action {
 	case "start":
 		return d.ensureCore()
@@ -77,11 +146,14 @@ func (d *desktop) execute(action string, task *tasks.Target) error {
 			return nil
 		}
 		fallthrough
-	case "open", "open_paired":
+	case "open", "open_paired", "open_bots", "open_notification":
 		if err := d.ensureCore(); err != nil {
 			return err
 		}
-		if err := d.showOrca(action == "open_paired", task); err != nil {
+		if request.notificationID != "" {
+			task = d.notificationTaskTarget(request.notificationID)
+		}
+		if err := d.showOrca(action == "open_paired", task, action); err != nil {
 			return err
 		}
 		d.setMessage("窗口已打开")
@@ -105,6 +177,7 @@ func (d *desktop) execute(action string, task *tasks.Target) error {
 			return err
 		}
 		d.setMessage("内核已停止")
+		d.showNativeManagement()
 	case "check_app":
 		return d.checkAppUpdate()
 	case "install_app":
@@ -138,7 +211,25 @@ func (d *desktop) execute(action string, task *tasks.Target) error {
 		d.statusMu.Unlock()
 	case "import_official":
 		return d.importOfficial()
+	case "notifications_on", "notifications_off":
+		d.settingsMu.Lock()
+		defer d.settingsMu.Unlock()
+		enabled := action == "notifications_on"
+		cfg, _, err := loadConfig(d.paths.root)
+		if err != nil {
+			return err
+		}
+		cfg.Notifications = enabled
+		if err := saveConfig(cfg, d.paths.settings); err != nil {
+			return err
+		}
+		d.statusMu.Lock()
+		d.notifications = enabled
+		d.message = "通知设置已保存"
+		d.statusMu.Unlock()
 	case "autostart":
+		d.settingsMu.Lock()
+		defer d.settingsMu.Unlock()
 		d.statusMu.RLock()
 		next := !d.autostart
 		d.statusMu.RUnlock()
@@ -445,7 +536,7 @@ func (d *desktop) restoreImport(reopen *orcaWindow, running bool) error {
 
 func (d *desktop) reopen(w *orcaWindow) {
 	if w != nil && !d.quitting.Load() {
-		if err := d.showOrca(w.paired, nil); err != nil {
+		if err := d.showOrca(w.paired, nil, "open"); err != nil {
 			d.setMessage(err.Error())
 		}
 	}
@@ -475,7 +566,32 @@ func (d *desktop) quit() {
 func (d *desktop) pollTasks() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	lastWaiting := 0
+	var macLights chan trayTaskLights
+	if runtime.GOOS == "darwin" && !d.nativeTray {
+		macLights = make(chan trayTaskLights, 1)
+		go d.animateMacTray(macLights)
+	}
+	var lastLights trayTaskLights
+	var tracker trayTaskTracker
+	observedPID := 0
+	updateLights := func(lights trayTaskLights) {
+		if d.nativeTray {
+			d.refreshNativeTray(false)
+			return
+		}
+		if lights == lastLights {
+			return
+		}
+		lastLights = lights
+		if macLights == nil {
+			d.setTrayLights(lights)
+			return
+		}
+		select {
+		case macLights <- lights:
+		case <-d.ctx.Done():
+		}
+	}
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -488,15 +604,20 @@ func (d *desktop) pollTasks() {
 			d.statusMu.Lock()
 			d.taskPID, d.taskSummary, d.taskAttempted = 0, nil, false
 			d.statusMu.Unlock()
-			if lastWaiting != 0 {
-				d.setTrayBadge(0)
-				lastWaiting = 0
+			if d.nativeTray && observedPID != 0 {
+				_, change := tracker.observe(tasks.Summary{})
+				d.clearNativeNotices(change.cleared)
 			}
+			observedPID, tracker = 0, trayTaskTracker{}
+			updateLights(trayTaskLights{})
 			continue
 		}
 		pid := status.PID
 		summary, err := tasks.Read(d.ctx, d.paths.data, uint32(pid))
-		if d.core.Status().PID != pid {
+		if d.ctx.Err() != nil {
+			return
+		}
+		if current := d.core.Status(); current.PID != pid || current.Phase != "running" {
 			continue
 		}
 		d.statusMu.Lock()
@@ -507,15 +628,23 @@ func (d *desktop) pollTasks() {
 			d.taskSummary = &summary
 		}
 		d.statusMu.Unlock()
-		waiting := 0
-		for _, row := range summary.Rows {
-			if err == nil && !summary.Partial && (row.Status == tasks.Waiting || row.Status == tasks.Blocked) {
-				waiting++
+		if observedPID != pid {
+			if d.nativeTray {
+				_, change := tracker.observe(tasks.Summary{})
+				d.clearNativeNotices(change.cleared)
 			}
+			observedPID, tracker = pid, trayTaskTracker{}
 		}
-		if waiting != lastWaiting {
-			d.setTrayBadge(waiting)
-			lastWaiting = waiting
+		if err != nil {
+			updateLights(trayTaskLights{unavailable: true})
+			continue
+		}
+		lights, change := tracker.observe(summary)
+		updateLights(lights)
+		if d.nativeTray {
+			d.publishTaskNotices(change)
+		} else if notice := change.notice(); notice != "" {
+			d.notify(notice)
 		}
 	}
 }

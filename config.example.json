@@ -8,6 +8,7 @@
   "autostart": false,
   "global_shortcut": "CommandOrControl+Shift+O",
   "notifications": true,
+  "macos_entries": { "menu_bar": true, "notch": false },
   "environment": {},
   "startup_timeout_secs": 60,
   "shutdown_timeout_secs": 8

@@ -23,6 +23,10 @@
       .titlebar:has(> #titlebar-tabs.invisible):not(:has(button, .titlebar-app-name)) {
         display: none;
       }
+      /* Orca renders this indicator separately from the scrollable tab strip. */
+      [data-testid="tab-strip-scroll-indicator"] {
+        display: none;
+      }
     `;
     root.append(style);
   }
