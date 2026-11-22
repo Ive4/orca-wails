@@ -135,3 +135,32 @@ diff --git a/src/renderer/src/components/bots/orca-cloud-sign-in.tsx b/src/rende
    const account = useBotHostOrcaAccount(hostId)
    return (
      <BotHostSignInControl
+diff --git a/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts b/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts
+--- a/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts
++++ b/src/renderer/src/components/agent/launch-menu/use-new-tab-agent-menu-rows.ts
+@@ -12,6 +12,7 @@
+ import { nativeChatPreferenceFor } from '../../../../../shared/agent-launch/choices/structured-native-chat-launch-route'
+ import type { AgentMenuRowsTarget, NewTabAgentMenuModel } from './new-tab-agent-menu-model'
+
++import { getWailsDesktopBridge } from '@/wails/local-runtime'
+ import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import { useMemo } from 'react'
+ import { useShallow } from 'zustand/react/shallow'
+@@ -199,12 +200,17 @@
+   const holding = viewActive && (open || shown) && !plain && !unresolvedTarget
+   useChatProgramFacts(workspace, holding)
+   useChatProgramFacts({ kind: 'floating' }, holding && !local)
++  // A slow chat probe should not hide verified local CLI launch choices in Wails.
++  const canShowLocalCLI =
++    local && !options?.onlyEnabledChats && Boolean(getWailsDesktopBridge()) &&
++    (detection.detectedIds?.length ?? 0) > 0
+   // Only dependencies that can enable an action hold the cold fill; failed inventory ends its own.
+   const loading =
+     !unresolvedTarget &&
+     (preferencesPending ||
+       (detection.detectedIds === null && detectionTarget !== undefined && !inventoryFailed) ||
+       (!plain &&
++        !canShowLocalCLI &&
+         (capabilityPending ||
+           (!local && localAcquiring) ||
+           availability?.state === 'pending' ||
