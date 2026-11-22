@@ -111,3 +111,27 @@ index b03ad78..394e5bc 100644
    let flow = from
    let opened = false
    while (entry.flowId === flow.flowId) {
+diff --git a/src/renderer/src/components/bots/orca-cloud-sign-in.tsx b/src/renderer/src/components/bots/orca-cloud-sign-in.tsx
+--- a/src/renderer/src/components/bots/orca-cloud-sign-in.tsx
++++ b/src/renderer/src/components/bots/orca-cloud-sign-in.tsx
+@@ -11,9 +11,7 @@
+ import { useAppStore } from '@/store'
+ import { getWailsLocalRuntimeId } from '@/runtime/hosts/display/wails-local-runtime'
+ import { useBotHostOrcaAccount } from '@/lib/bot-host-orca-account'
+-import {
+-  toRuntimeExecutionHostId,
+-  type ExecutionHostId
+-} from '../../../../shared/execution-host/execution-host'
++import type { ExecutionHostId } from '../../../../shared/execution-host/execution-host'
++import { runtimeConnectionHostId } from '@/web/runtime/client/web-runtime-calls'
+ import { BotHostSignInControl } from './BotConnectorsHostNotice'
+ import { useOrcaCloudSignedOut } from './orca-cloud-signed-out'
+@@ -78,7 +76,7 @@
+   onSignedIn?: () => unknown
+ }): React.JSX.Element {
+   const t = useTranslate()
+-  const hostId = toRuntimeExecutionHostId(environmentId)
++  const hostId = runtimeConnectionHostId(environmentId)
+   const account = useBotHostOrcaAccount(hostId)
+   return (
+     <BotHostSignInControl

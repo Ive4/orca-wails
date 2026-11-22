@@ -1,6 +1,6 @@
 {
   "version": "v1.4.269",
-  "package_revision": "0.0.32",
+  "package_revision": "0.0.33",
   "target": "aarch64-apple-darwin",
   "upstream_target": "darwin-arm64",
   "upstream": {

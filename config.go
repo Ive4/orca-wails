@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -228,6 +229,24 @@ func (c config) launchSpec(p paths, slot *update.Installed) (core.Spec, error) {
 		env[key] = value
 	}
 	if runtime.GOOS == "darwin" {
+		if _, explicit := env["PATH"]; !explicit {
+			// Finder starts with a system PATH. Keep its ordering and let Core
+			// hydrate the login shell for any additional tool locations.
+			searchPath := filepath.SplitList(os.Getenv("PATH"))
+			if len(searchPath) == 0 {
+				searchPath = []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+			}
+			bins := []string{"/opt/homebrew/bin", "/usr/local/bin"}
+			if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+				bins = append(bins, filepath.Join(home, ".local/bin"))
+			}
+			for _, bin := range bins {
+				if !slices.Contains(searchPath, bin) {
+					searchPath = append(searchPath, bin)
+				}
+			}
+			env["PATH"] = strings.Join(searchPath, string(os.PathListSeparator))
+		}
 		configPath, err := filepath.Abs(p.settings)
 		if err != nil {
 			return core.Spec{}, err

@@ -120,6 +120,43 @@ func TestComputerUsePreferencesArePersisted(t *testing.T) {
 	}
 }
 
+func TestMacOSCoreLaunchFindsUserToolsWithFinderPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Core launch")
+	}
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	const finderPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+	t.Setenv("PATH", finderPath)
+	cfg, paths, err := loadConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.core, "server"), nil, 0700); err != nil {
+		t.Fatal(err)
+	}
+	slot := update.Installed{Dir: paths.core, Manifest: update.Manifest{
+		Executable: "server", WorkingDirectory: ".", HealthPath: "/health",
+	}}
+	spec, err := cfg.launchSpec(paths, &slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := finderPath + ":/opt/homebrew/bin:/usr/local/bin:" + filepath.Join(root, ".local/bin")
+	if got := spec.Env["PATH"]; got != want {
+		t.Fatalf("Core PATH = %q, want %q", got, want)
+	}
+
+	cfg.Environment["PATH"] = "/custom/bin"
+	spec, err = cfg.launchSpec(paths, &slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Env["PATH"]; got != "/custom/bin" {
+		t.Fatalf("explicit Core PATH = %q", got)
+	}
+}
+
 func TestCoreLaunchExposesComputerUseConfigOnMacOS(t *testing.T) {
 	cfg, paths, err := loadConfig(t.TempDir())
 	if err != nil {
