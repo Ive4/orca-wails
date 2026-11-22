@@ -189,7 +189,7 @@ def install_web_dependencies(pnpm, checkout, env):
         if result.returncode == 0:
             return
         if attempt == 2 or not ('running updateConfig hook' in result.stderr
-                                and 'Broken pipe' in result.stderr):
+                                and 'Broken pipe' in ' '.join(result.stderr.split())):
             result.check_returncode()
         print('Retrying pnpm install after its updateConfig worker lost the pipe.', file=sys.stderr)
 
@@ -210,6 +210,9 @@ def build_data_plugin_core(args, upstream, work, stage):
     copy_resource(checkout / 'LICENSE', stage / 'licenses/ORCA-LICENSE', upstream['license_sha256'])
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('ELECTRON_', 'ORCA_', 'NODE_', 'BUN_', 'GIT_'))}
+    # Keep Tailwind's ignore scan inside the extracted source tree. Parent
+    # directories such as /tmp may have a catch-all .gitignore.
+    subprocess.run(['/usr/bin/git', 'init', '--quiet'], cwd=checkout, env=env, check=True, timeout=30)
     # The local runtime patch builds on the data-plugin settings navigation.
     for name in (
         'macos-data-plugins.patch',
@@ -251,6 +254,11 @@ def build_data_plugin_core(args, upstream, work, stage):
     web = checkout / 'out/web'
     require((web / 'web-index.html').is_file(), 'Built Web entry is missing')
     require((web / 'wails-index.html').is_file(), 'Built desktop entry is missing')
+    # Tailwind can emit base styles without utilities when its automatic scan skips the checkout.
+    utilities = ('.flex{', '.grid{', '.items-center{', '.w-full{')
+    require(any(all(selector in css for selector in utilities)
+                for css in (file.read_text() for file in (web / 'assets').glob('*.css'))),
+            'Built desktop CSS is missing layout utilities')
     for file in sorted(web.rglob('*')):
         if file.is_file():
             relative = file.relative_to(web).as_posix()
