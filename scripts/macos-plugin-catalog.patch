@@ -256,8 +256,8 @@ index 7f2976d..4a053ef 100644
 +        return
 +      }
        const [nextSources, nextListings] = await Promise.all([
-         window.api.plugins.listMarketplaces(),
-         window.api.plugins.listMarketplacePlugins()
+         window.api.plugins.listMarketplaces({ waitForRefresh: true }),
+         window.api.plugins.listMarketplacePlugins({ waitForRefresh: true })
        ])
 -      if (mountedRef.current && requestId === requestRef.current) {
 -        setSources(nextSources)

@@ -16,7 +16,7 @@ package main
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))complete {
-	complete(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList);
+	complete(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList | UNNotificationPresentationOptionSound);
 }
 @end
 
@@ -40,7 +40,7 @@ static void orcaNotifyDesktop(const char *message, size_t length) {
 				}
 				center.delegate = orcaNotificationDelegate;
 			}
-			[center requestAuthorizationWithOptions:UNAuthorizationOptionAlert
+			[center requestAuthorizationWithOptions:UNAuthorizationOptionAlert | UNAuthorizationOptionSound
 			                      completionHandler:^(BOOL granted, NSError *error) {
 				if (!granted) {
 					return;
@@ -49,6 +49,7 @@ static void orcaNotifyDesktop(const char *message, size_t length) {
 					UNMutableNotificationContent *content = [UNMutableNotificationContent new];
 					content.title = @"Orca-Wails";
 					content.body = body;
+					content.sound = [UNNotificationSound defaultSound];
 					UNNotificationRequest *request = [UNNotificationRequest
 						requestWithIdentifier:[NSUUID UUID].UUIDString content:content trigger:nil];
 					[center addNotificationRequest:request withCompletionHandler:nil];

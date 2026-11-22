@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -120,6 +121,9 @@ func (event readinessEvent) verify(spec Spec, pid int) (offer, detail string, er
 		return "", "", errors.New("Orca pairing availability is invalid")
 	}
 	if !available {
+		if slices.Contains(spec.Args, "--no-pairing") {
+			return "", "", nil
+		}
 		return "", "Core is ready, but pairing is unavailable. Review the core pairing configuration before opening a window.", nil
 	}
 	offer, ok = pairing["webClientUrl"].(string)

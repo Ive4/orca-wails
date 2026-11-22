@@ -9,6 +9,8 @@
   "global_shortcut": "CommandOrControl+Shift+O",
   "notifications": true,
   "macos_entries": { "menu_bar": true, "notch": false },
+  "computer_use_backend": "cua",
+  "computer_use_vm_ssh": "",
   "environment": {},
   "startup_timeout_secs": 60,
   "shutdown_timeout_secs": 8

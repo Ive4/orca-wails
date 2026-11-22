@@ -48,9 +48,134 @@ func TestSummaryProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantJSON := `{"id":"523566371f123ecf53b1471e46a8331981788c5934c7843ca79a8183853a983b","title":"Build task","workspace":"Build","provider":"codex","status":"working","startedAt":100,"updatedAt":2000}`
+	key, _ := rowID("ws-id", nil, "")
+	wantJSON := `{"id":"523566371f123ecf53b1471e46a8331981788c5934c7843ca79a8183853a983b","title":"Build task","workspace":"Build","provider":"codex","status":"working","startedAt":100,"updatedAt":2000,"launchKey":"523566371f123ecf53b1471e46a8331981788c5934c7843ca79a8183853a983b","workspaceKey":"` + key + `"}`
 	if string(payload) != wantJSON {
 		t.Fatalf("row wire JSON = %s, want %s", payload, wantJSON)
+	}
+}
+
+func TestCompletedDurationProjection(t *testing.T) {
+	fixture := strings.NewReplacer(
+		`"state":"done","stateStartedAt":500`, `"state":"done","stateStartedAt":500,"completedAt":750,"completedDurationSeconds":0`,
+		`"state":"working","taskTitle"`, `"state":"working","completedAt":750,"completedDurationSeconds":522,"taskTitle"`,
+	).Replace(listingFixture)
+	summary, err := parseResponse([]byte(fixture), "rt_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range summary.Rows {
+		payload, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(string(payload), `"completedDurationSeconds":0`); got != (row.Status == Done) {
+			t.Errorf("duration projection for %s: %s", row.Status, payload)
+		}
+		if strings.Contains(string(payload), `"completedDurationSeconds":522`) {
+			t.Errorf("unexpected duration on a running task: %s", payload)
+		}
+		if got := strings.Contains(string(payload), `"startedAt":750`); got != (row.Status == Done) {
+			t.Errorf("completion clock projection for %s: %s", row.Status, payload)
+		}
+	}
+}
+
+func TestActiveToolInTraySnapshot(t *testing.T) {
+	fixture := strings.NewReplacer(
+		`"taskTitle":"Build task"`, `"taskTitle":"Build task","toolName":" git status "`,
+		`"workingMode":"monitoring"`, `"workingMode":"monitoring","toolName":"orca://pair?code=secret"`,
+		`"state":"done"`, `"state":"done","toolName":"old tool"`,
+	).Replace(listingFixture)
+	summary, err := parseResponse([]byte(fixture), "rt_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range summary.Rows {
+		payload, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.Status == Working {
+			if !strings.Contains(string(payload), `"currentTool":"git status"`) {
+				t.Errorf("missing current tool: %s", payload)
+			}
+		} else if strings.Contains(string(payload), `"currentTool"`) {
+			t.Errorf("unexpected current tool on %s: %s", row.Status, payload)
+		}
+	}
+}
+
+func TestOutputMetricsInTraySnapshot(t *testing.T) {
+	const valid = `{"turnOutputTokens":1200,"visibleTokensPerSecond":18,"visibleUntil":4102444800000}`
+	owned := `"paneKey":"tab:` + structuredLeafID("session") + `","orcaSessionId":"session","structuredHostOwned":true`
+	for _, tc := range []struct {
+		name, metrics, want string
+		agent, state, host  string
+	}{
+		{name: "known", metrics: valid, want: valid},
+		{name: "settled request rate", metrics: `{"turnOutputTokens":1200,"visibleTokensPerSecond":18,"visibleUntil":4102444800000,"requestRate":true}`, want: `{"turnOutputTokens":1200,"visibleTokensPerSecond":18,"visibleUntil":4102444800000,"requestRate":true}`},
+		{name: "running tool", metrics: `{"turnOutputTokens":1200,"toolActive":true}`, want: `{"turnOutputTokens":1200,"toolActive":true}`},
+		{name: "settled tool", metrics: `{"turnOutputTokens":1200,"toolActive":false}`, want: `{"turnOutputTokens":1200}`},
+		{name: "invalid tool activity", metrics: `{"turnOutputTokens":1200,"toolActive":"true"}`, want: `{"turnOutputTokens":1200}`},
+		{name: "old Core"},
+		{name: "malformed object", metrics: `"unavailable"`},
+		{name: "malformed token count", metrics: `{"turnOutputTokens":"1200","visibleTokensPerSecond":18,"visibleUntil":4102444800000}`, want: `{"visibleTokensPerSecond":18,"visibleUntil":4102444800000}`},
+		{name: "malformed rate", metrics: `{"turnOutputTokens":9,"visibleTokensPerSecond":1.5,"visibleUntil":4102444800000}`, want: `{"turnOutputTokens":9}`},
+		{name: "legacy character rate", metrics: `{"turnOutputTokens":9,"visibleCharsPerSecond":18,"visibleUntil":4102444800000}`, want: `{"turnOutputTokens":9}`},
+		{name: "missing expiration", metrics: `{"visibleTokensPerSecond":18}`},
+		{name: "invalid expiration", metrics: `{"visibleTokensPerSecond":18,"visibleUntil":-1}`},
+		{name: "expired", metrics: `{"turnOutputTokens":9,"visibleTokensPerSecond":18,"visibleUntil":1,"requestRate":true}`, want: `{"turnOutputTokens":9}`},
+		{name: "nonpositive", metrics: `{"turnOutputTokens":0,"visibleTokensPerSecond":0,"visibleUntil":4102444800000}`},
+		{name: "terminal", agent: `"paneKey":"tab:leaf"`, metrics: valid},
+		{name: "unmatched leaf", agent: strings.Replace(owned, structuredLeafID("session"), "leaf", 1), metrics: valid},
+		{name: "unowned", agent: strings.Replace(owned, `"structuredHostOwned":true`, `"structuredHostOwned":false`, 1), metrics: valid},
+		{name: "remote", host: "remote:other", metrics: valid},
+		{name: "monitoring", agent: owned + `,"workingMode":"monitoring"`, metrics: valid},
+		{name: "unconfirmed", agent: owned + `,"restoredUnconfirmed":true`, metrics: valid},
+		{name: "waiting", state: "waiting", metrics: valid},
+		{name: "blocked", state: "blocked", metrics: valid},
+		{name: "done", state: "done", metrics: valid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent, state := tc.agent, tc.state
+			if agent == "" {
+				agent = owned
+			}
+			if state == "" {
+				state = "working"
+			}
+			fields := agent + `,"state":"` + state + `"`
+			fixture := listingFixture
+			if tc.host != "" {
+				fixture = strings.Replace(fixture, `"worktreeId":"ws-id"`, `"worktreeId":"ws-id","hostId":"`+tc.host+`"`, 1)
+			}
+			if tc.metrics != "" {
+				fields += `,"outputMetrics":` + tc.metrics
+			}
+			fixture = strings.Replace(fixture, `"paneKey":"tab:leaf","state":"working"`, fields, 1)
+			summary, err := parseResponse([]byte(fixture), "rt_test")
+			if err != nil || len(summary.Rows) != 7 {
+				t.Fatalf("expected all task rows, got %+v, %v", summary, err)
+			}
+			for _, row := range summary.Rows {
+				payload, err := json.Marshal(row)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := tc.want
+				if row.Title != "Build task" {
+					want = ""
+				}
+				var projected struct{ OutputMetrics json.RawMessage }
+				if err := json.Unmarshal(payload, &projected); err != nil {
+					t.Fatal(err)
+				}
+				if got := string(projected.OutputMetrics); got != want {
+					t.Errorf("%s outputMetrics = %q, want %q", row.Title, got, want)
+				}
+			}
+		})
 	}
 }
 

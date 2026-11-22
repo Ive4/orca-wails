@@ -1,0 +1,287 @@
+diff --git a/src/main/orcad/host-runtime/orcad-data-plugins.ts b/src/main/orcad/host-runtime/orcad-data-plugins.ts
+index ea5fb4f..d124b9e 100644
+--- a/src/main/orcad/host-runtime/orcad-data-plugins.ts
++++ b/src/main/orcad/host-runtime/orcad-data-plugins.ts
+@@ -77,6 +77,11 @@ import {
+   PluginsPanelActionParams
+ } from '../../../shared/rpc-contract/plugins/plugins-params'
+ 
++import {
++  PluginStatusBarState,
++  pluginStatusBarRevision
++} from '../../plugins/status-bar/plugin-status-bar-state'
++
+ const capabilities = [
+   'app-theme',
+   'terminal-theme',
+@@ -86,7 +91,8 @@ const capabilities = [
+   'new-file',
+   'worker',
+   'script-panel',
+-  'custom-editor'
++  'custom-editor',
++  'status-bar'
+ ] as const
+ 
+ export function pluginManifestUnavailableReason(manifest: PluginManifest): string | null {
+@@ -106,8 +112,8 @@ export function pluginManifestUnavailableReason(manifest: PluginManifest): strin
+   if (manifest.contributes.fonts.length > 0) {
+     return 'Plugin fonts require the desktop resource protocol.'
+   }
+-  if (manifest.contributes.vmRecipes.length > 0 || manifest.contributes.statusBarItems.length > 0) {
+-    return 'This plugin requires desktop VM recipe or status bar services.'
++  if (manifest.contributes.vmRecipes.length > 0) {
++    return 'This plugin requires desktop VM recipe services.'
+   }
+   return null
+ }
+@@ -149,6 +155,7 @@ export async function startOrcadDataPlugins(
+   const pluginsDataDir = getPluginsDataDir(userDataPath)
+   const killList = new PluginKillListService({ pluginsDataDir })
+   await killList.initialize()
++  const statusBar = new PluginStatusBarState()
+   const service = new PluginService({
+     userDataPath,
+     hostVersion,
+@@ -157,6 +164,7 @@ export async function startOrcadDataPlugins(
+     getPluginConsents: () => normalizePluginConsents(store.getSettings().pluginConsents),
+     getDevPluginPaths: () => [],
+     headless: true,
++    statusBar,
+     hostEntryPath: join(__dirname, 'plugin-host-entry.js'),
+     admitManifest: (manifest) => pluginManifestUnavailableReason(manifest) === null,
+     getPluginKillListEntry: (key) => killList.find(key)
+@@ -213,6 +221,10 @@ export async function startOrcadDataPlugins(
+   }
+   active = state
+   const stopChanges = service.onChanged(({ contentPacksChanged }) => {
++    statusBar.prune((pluginKey) => {
++      const plugin = service.findApprovedPlugin(pluginKey, true)
++      return plugin ? pluginStatusBarRevision(plugin) : null
++    })
+     if (contentPacksChanged) {
+       state.revision++
+     }
+@@ -378,6 +390,27 @@ export const ORCAD_DATA_PLUGIN_METHODS = [
+         disabledPlugins: active.service.options.getDisabledPlugins()
+       }
+   }),
++  defineStreamingMethod({
++    name: 'dataPlugins.statusBarWatch',
++    permission,
++    params: null,
++    handler: async (_params, { signal }, emit) => {
++      const statusBar = (await host(false)).service.options.statusBar
++      if (!statusBar || !signal || signal.aborted) return
++      await new Promise<void>((resolve) => {
++        const stop = statusBar.onChanged(emit)
++        signal.addEventListener(
++          'abort',
++          () => {
++            stop()
++            resolve()
++          },
++          { once: true }
++        )
++        emit(statusBar.snapshot())
++      })
++    }
++  }),
+   defineMethod({
+     name: 'dataPlugins.setSystemEnabled',
+     permission,
+@@ -386,6 +419,7 @@ export const ORCAD_DATA_PLUGIN_METHODS = [
+       mutate(async ({ store, service }) => {
+         store.updateSettings({ pluginSystemEnabled: enabled }, { notifyListeners: true })
+         await service.whenReady()
++        return null
+       })
+   }),
+   defineMethod({
+diff --git a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts
+index 608ec48..fc1fb2d 100644
+--- a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts
++++ b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.test.ts
+@@ -5,6 +5,7 @@ import { callRuntimeResult } from '../../runtime/client/web-runtime-calls'
+ vi.mock('../../runtime/client/web-runtime-calls', () => ({ callRuntimeResult: vi.fn() }))
+ vi.mock('../../runtime/client/web-runtime-session', () => ({
+   requireActiveEnvironmentOrNull: () => ({
++    id: 'local',
+     endpoints: [{ endpoint: 'ws://127.0.0.1:54321' }]
+   })
+ }))
+@@ -88,3 +89,52 @@ it('connects the official plugin page to the paired local host and forwards inst
+     vi.unstubAllGlobals()
+   }
+ })
++
++it('streams local plugin status items after capability discovery and clears on pairing change', async () => {
++  const close = vi.fn()
++  let emit!: (event: unknown) => void
++  let disconnect!: () => void
++  const subscribe = vi.fn(async (_args, callbacks) => {
++    emit = callbacks.onResponse
++    disconnect = callbacks.onClose
++    return { unsubscribe: close }
++  })
++  const location = { hostname: 'localhost', protocol: 'http:', host: '127.0.0.1:54321' }
++  vi.stubGlobal('window', { location, api: { runtimeEnvironments: { subscribe } } })
++  try {
++    await probeWebDataPlugins()
++    vi.mocked(callRuntimeResult).mockResolvedValue({
++      enabled: true,
++      revision: 1,
++      disabledPlugins: [],
++      capabilities: ['status-bar']
++    })
++    const api = createWebPluginsApi()
++    const update = vi.fn()
++    const stop = api.onStatusBarChanged!(update)
++    expect(subscribe).not.toHaveBeenCalled()
++    location.hostname = '127.0.0.1'
++    await probeWebDataPlugins()
++    expect(subscribe).toHaveBeenCalledWith(
++      { selector: 'local', method: 'dataPlugins.statusBarWatch' },
++      expect.objectContaining({ onResponse: expect.any(Function), onClose: expect.any(Function) })
++    )
++    const snapshot = { 'publisher.test': { health: { text: 'Ready' } } }
++    emit({ ok: true, result: snapshot })
++    expect(update).toHaveBeenLastCalledWith(snapshot)
++    await expect(api.statusBarState!()).resolves.toEqual(snapshot)
++    disconnect()
++    expect(update).toHaveBeenLastCalledWith({})
++    await probeWebDataPlugins()
++    expect(subscribe).toHaveBeenCalledTimes(2)
++    emit({ ok: true, result: snapshot })
++    expect(update).toHaveBeenLastCalledWith(snapshot)
++    location.hostname = 'localhost'
++    await probeWebDataPlugins()
++    expect(update).toHaveBeenLastCalledWith({})
++    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(2))
++    stop()
++  } finally {
++    vi.unstubAllGlobals()
++  }
++})
+diff --git a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts
+index 7045151..6765347 100644
+--- a/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts
++++ b/src/renderer/src/web/preload-api/host-capabilities/web-plugins-api.ts
+@@ -4,11 +4,13 @@ import type {
+   PluginsApi
+ } from '../../../../../preload/api/plugins/plugin-host-api'
+ import type { GlobalSettings } from '../../../../../shared/settings/global-settings-types'
++import type { PluginStatusBarOverrides } from '../../../../../shared/plugins/contributions/plugin-status-bar-state'
+ import type { PluginChangeEvent } from '../../../../../shared/plugins/events/plugin-change-event'
+ import { callRuntimeResult } from '../../runtime/client/web-runtime-calls'
+ import { requireActiveEnvironmentOrNull } from '../../runtime/client/web-runtime-session'
+ 
+ const listeners = new Set<(event: PluginChangeEvent) => void>()
++const statusProbes = new Set<() => void>()
+ let status: DataPluginStatus | null = null
+ 
+ function hasLocalPairing(): boolean {
+@@ -64,10 +66,13 @@ export async function probeWebDataPlugins(timeout = 4_000): Promise<void> {
+   if (update) {
+     changed()
+   }
++  for (const notify of statusProbes) notify()
+ }
+ 
+ export function createWebPluginsApi(): Partial<PluginsApi> {
+   const check = () => status !== null && hasLocalPairing()
++  const hasStatusBar = () => check() && status?.capabilities?.includes('status-bar') === true
++  let statusBarSnapshot: PluginStatusBarOverrides = {}
+   const read = <T>(operation: string): Promise<T[]> =>
+     check() ? call<T[]>(operation) : Promise.resolve([])
+   const mutate = async <T>(operation: string, params: unknown, timeout?: number): Promise<T> => {
+@@ -89,6 +94,55 @@ export function createWebPluginsApi(): Partial<PluginsApi> {
+   }
+   return {
+     dataMarketplace: marketplace,
++    statusBarState: async () => (hasStatusBar() ? statusBarSnapshot : {}),
++    onStatusBarChanged: (listener) => {
++      let stream: Promise<{ unsubscribe: () => void }> | undefined
++      const stopStream = () => {
++        const previous = stream
++        stream = undefined
++        void previous?.then((handle) => handle.unsubscribe()).catch(() => {})
++      }
++      const clear = () => {
++        stopStream()
++        statusBarSnapshot = {}
++        listener(statusBarSnapshot)
++      }
++      const refreshStream = () => {
++        const environment = hasStatusBar() ? requireActiveEnvironmentOrNull() : null
++        if (!environment) {
++          if (stream) clear()
++          return
++        }
++        if (stream) return
++        const disconnect = () => {
++          if (stream === next) clear()
++        }
++        const next = window.api.runtimeEnvironments.subscribe(
++          { selector: environment.id, method: 'dataPlugins.statusBarWatch' },
++          {
++            onResponse: (reply) => {
++              if (stream !== next || !hasStatusBar()) return
++              if (!reply.ok) {
++                disconnect()
++                return
++              }
++              statusBarSnapshot = reply.result as PluginStatusBarOverrides
++              listener(statusBarSnapshot)
++            },
++            onClose: disconnect,
++            onError: disconnect
++          }
++        )
++        stream = next
++        void next.catch(disconnect)
++      }
++      statusProbes.add(refreshStream)
++      refreshStream()
++      return () => {
++        statusProbes.delete(refreshStream)
++        stopStream()
++      }
++    },
+     list: () => read('list'),
+     invokeCommand: (args) => call('invokeCommand', args, 120_000),
+     readPanelEntry: ({ pluginKey, panelId }) => call('readPanelEntry', { pluginKey, panelId }),
+diff --git a/src/shared/plugins/workers/plugin-host-api.ts b/src/shared/plugins/workers/plugin-host-api.ts
+index 2fcb289..7dc791a 100644
+--- a/src/shared/plugins/workers/plugin-host-api.ts
++++ b/src/shared/plugins/workers/plugin-host-api.ts
+@@ -4,6 +4,7 @@ import * as stored from './plugin-host-api-storage-schemas'
+ import { PLUGIN_PANEL_BRIDGE_API } from './plugin-host-api-panel-methods'
+ import { PLUGIN_WORKER_ACTIONS_API } from './plugin-host-api-worker-actions'
+ import { PLUGIN_EDITOR_TYPOGRAPHY_API } from './plugin-host-api-editor-typography'
++import { PLUGIN_STATUS_BAR_API } from './plugin-host-api-status-bar'
+ import {
+   PLUGIN_TERMINAL_ID_MAX_LENGTH,
+   pluginWorkspaceContextSchema
+@@ -288,7 +289,8 @@ export const PLUGIN_HOST_API = {
+   }),
+   ...PLUGIN_PANEL_BRIDGE_API,
+   ...PLUGIN_WORKER_ACTIONS_API,
+-  ...PLUGIN_EDITOR_TYPOGRAPHY_API
++  ...PLUGIN_EDITOR_TYPOGRAPHY_API,
++  ...PLUGIN_STATUS_BAR_API
+ }
+ 
+ export type PluginHostApi = typeof PLUGIN_HOST_API
+diff --git a/src/shared/rpc-contract/rpc-params-catalog.generated.ts b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+index d2b288a..044ec29 100644
+--- a/src/shared/rpc-contract/rpc-params-catalog.generated.ts
++++ b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+@@ -1517,6 +1517,7 @@ export const RPC_PARAMS_BY_METHOD = {
+   'dataPlugins.setSystemEnabled': DataPluginSystemParams,
+   'dataPlugins.sources': null,
+   'dataPlugins.status': null,
++  'dataPlugins.statusBarWatch': null,
+   'dataPlugins.syntaxes': null,
+   'dataPlugins.terminalThemes': null,
+   'dataPlugins.themes': null,

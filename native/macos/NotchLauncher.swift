@@ -51,7 +51,7 @@ final class NotchLauncher: NSPanel {
     private var contentHeight: CGFloat = 0
     private var hasCount = false
     private var lastLights: TrayLights?
-    private var animation: Timer?
+    private var stopAnimation: (() -> Void)?
     private var destination: NSRect?
     var onToggle: (() -> Void)?
     var onCount: (() -> Void)?
@@ -90,6 +90,11 @@ final class NotchLauncher: NSPanel {
     }
 
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+
+    override func orderOut(_ sender: Any?) {
+        super.orderOut(sender)
+        if stopAnimation != nil { finishAnimation() }
+    }
 
     func expand(_ panel: TrayPanel, key: Bool) {
         host?.removeFromSuperview()
@@ -158,34 +163,45 @@ final class NotchLauncher: NSPanel {
         let target = host == nil ? geometry.compact(hasCount: hasCount) : geometry.expanded(contentHeight: contentHeight)
         guard destination != target || !animated else { return }
         destination = target
-        animation?.invalidate()
-        animation = nil
+        stopAnimation?()
+        stopAnimation = nil
         let start = frame
         guard isVisible, animated, start != target, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             setShape(target)
+            invalidateShadow()
             return
         }
-        let began = ProcessInfo.processInfo.systemUptime
+        let began = CACurrentMediaTime()
         let duration = target.height > start.height ? 0.24 : 0.185
-        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
-            guard let self else { timer.invalidate(); return }
-            let finished = MainActor.assumeIsolated {
-                let t = min(1, (ProcessInfo.processInfo.systemUptime - began) / duration)
-                let amount = 1 - pow(1 - t, 4)
-                let x = start.minX + (target.minX - start.minX) * amount
-                let width = start.width + (target.width - start.width) * amount
-                let height = start.height + (target.height - start.height) * amount
-                self.setShape(t == 1 ? target : NSRect(x: x, y: target.maxY - height, width: width, height: height))
-                if t == 1 {
-                    self.animation = nil
-                    self.invalidateShadow()
-                }
-                return t == 1
+        let advance: @MainActor @Sendable (CFTimeInterval) -> Bool = { [weak self] timestamp in
+            guard let self else { return false }
+            let t = min(1, max(0, (timestamp - began) / duration))
+            if t == 1 {
+                self.stopAnimation = nil
+                self.setShape(target)
+                self.invalidateShadow()
+                return false
             }
-            if finished { timer.invalidate() }
+            let remaining = 1 - t
+            let amount = 1 - remaining * remaining * remaining
+            let x = start.minX + (target.minX - start.minX) * amount
+            let width = start.width + (target.width - start.width) * amount
+            let height = start.height + (target.height - start.height) * amount
+            self.setShape(NSRect(x: x, y: target.maxY - height, width: width, height: height))
+            return true
         }
-        RunLoop.main.add(timer, forMode: .common)
-        animation = timer
+        if #available(macOS 14.0, *) {
+            let driver = NotchDisplayLink(advance: advance)
+            let link = displayLink(target: driver, selector: #selector(NotchDisplayLink.tick(_:)))
+            stopAnimation = { link.invalidate() }
+            link.add(to: .main, forMode: .common)
+        } else {
+            let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { timer in
+                if !MainActor.assumeIsolated({ advance(CACurrentMediaTime()) }) { timer.invalidate() }
+            }
+            stopAnimation = { timer.invalidate() }
+            RunLoop.main.add(timer, forMode: .common)
+        }
     }
 
     private func setShape(_ next: NSRect) {
@@ -205,8 +221,8 @@ final class NotchLauncher: NSPanel {
         (countButton as? NotchButton)?.statusVisibility = expansion
         host?.frame = NSRect(x: (frame.width - geometry.panelWidth) / 2, y: geometry.headerHeight,
                              width: geometry.panelWidth, height: contentHeight)
+        // Let AppKit coalesce drawing with the display refresh.
         surface.needsDisplay = true
-        displayIfNeeded()
     }
 
     @objc private func toggle() { onToggle?() }
@@ -214,7 +230,25 @@ final class NotchLauncher: NSPanel {
     override func cancelOperation(_ sender: Any?) { onClose?() }
 }
 
+@available(macOS 14.0, *)
+@MainActor
+private final class NotchDisplayLink: NSObject {
+    private let advance: @MainActor (CFTimeInterval) -> Bool
+
+    init(advance: @escaping @MainActor (CFTimeInterval) -> Bool) {
+        self.advance = advance
+    }
+
+    @objc func tick(_ link: CADisplayLink) {
+        if !advance(link.targetTimestamp) { link.invalidate() }
+    }
+}
+
 private final class NotchSurface: NSView {
+    private static let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
+        colors: [NSColor.black.cgColor,
+                 NSColor(srgbRed: 13.0 / 255, green: 18.0 / 255, blue: 29.0 / 255, alpha: 1).cgColor] as CFArray,
+        locations: [0, 1])
     var cutoutHeight: CGFloat = 0
     var onHover: ((Bool) -> Void)?
     private var tracking: NSTrackingArea?
@@ -252,9 +286,7 @@ private final class NotchSurface: NSView {
         path.addQuadCurve(to: CGPoint(x: w, y: 0), control: CGPoint(x: w - shoulder, y: 0))
         path.closeSubpath()
         context.addPath(path)
-        if depth > 0, let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
-                colors: [NSColor.black.cgColor, NSColor(srgbRed: 13.0 / 255, green: 18.0 / 255, blue: 29.0 / 255, alpha: 1).cgColor] as CFArray,
-                locations: [0, 1]) {
+        if depth > 0, let gradient = Self.gradient {
             context.clip()
             context.drawLinearGradient(gradient, start: CGPoint(x: 0, y: cutoutHeight),
                                        end: CGPoint(x: 0, y: h), options: [.drawsBeforeStartLocation])

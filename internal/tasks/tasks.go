@@ -27,15 +27,34 @@ type Summary struct {
 }
 
 type Row struct {
-	ID         string  `json:"id"`
-	Title      string  `json:"title"`
-	Workspace  string  `json:"workspace"`
-	Provider   *string `json:"provider"`
-	Status     Status  `json:"status"`
-	StartedAt  *uint64 `json:"startedAt"`
-	UpdatedAt  *uint64 `json:"updatedAt"`
-	Target     Target  `json:"-"`
-	QuickReply bool    `json:"quickReply,omitempty"`
+	ID                       string  `json:"id"`
+	Title                    string  `json:"title"`
+	Workspace                string  `json:"workspace"`
+	Provider                 *string `json:"provider"`
+	Status                   Status  `json:"status"`
+	StartedAt                *uint64 `json:"startedAt"`
+	UpdatedAt                *uint64 `json:"updatedAt"`
+	CompletedDurationSeconds *uint64 `json:"completedDurationSeconds,omitempty"`
+	Target                   Target  `json:"-"`
+	QuickReply               bool    `json:"quickReply,omitempty"`
+	Outcome                  string  `json:"outcome,omitempty"`
+	LaunchKey                string  `json:"launchKey,omitempty"`
+	WorkspaceKey             string  `json:"workspaceKey,omitempty"`
+	ConversationID           string  `json:"-"`
+	TerminalAddress          string  `json:"-"`
+	CurrentTool              *string `json:"currentTool,omitempty"`
+	LastResult               *string `json:"-"`
+	Local                    bool    `json:"-"`
+
+	OutputMetrics *OutputMetrics `json:"outputMetrics,omitempty"`
+}
+
+type OutputMetrics struct {
+	TurnOutputTokens       uint64 `json:"turnOutputTokens,omitempty"`
+	VisibleTokensPerSecond uint64 `json:"visibleTokensPerSecond,omitempty"`
+	VisibleUntil           uint64 `json:"visibleUntil,omitempty"`
+	RequestRate            bool   `json:"requestRate,omitempty"`
+	ToolActive             bool   `json:"toolActive,omitempty"`
 }
 
 type Target struct {
@@ -43,6 +62,7 @@ type Target struct {
 	TabID         string  `json:"tabId"`
 	LeafID        *string `json:"leafId"`
 	FocusComposer bool    `json:"focusComposer,omitempty"`
+	ChatSessionID string  `json:"sessionId,omitempty"`
 }
 
 type Status string
@@ -147,37 +167,132 @@ func readSummary(ctx context.Context, metadata runtimeMetadata) (Summary, error)
 	return parseResponse(line, metadata.runtimeID)
 }
 
-func runtimeRequest(ctx context.Context, metadata runtimeMetadata, id, method string, params any) ([]byte, error) {
-	stream, err := connectOwned(ctx, metadata)
+// CallLocal forwards a desktop request to its own Core and returns the RPC envelope.
+func CallLocal(ctx context.Context, data string, pid uint32, method string, params json.RawMessage) (json.RawMessage, error) {
+	stream, err := SubscribeLocal(ctx, data, pid, method, params)
 	if err != nil {
 		return nil, err
 	}
-	closeStream := sync.OnceFunc(func() { _ = stream.Close() })
-	defer closeStream()
-	stop := context.AfterFunc(ctx, closeStream)
-	defer stop()
-	if err := ctx.Err(); err != nil {
+	defer stream.Close()
+	return stream.Next()
+}
+
+type desktopQuestionKeyContext struct{}
+
+func WithDesktopQuestionAccess(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, desktopQuestionKeyContext{}, key)
+}
+
+func runtimeRequest(ctx context.Context, metadata runtimeMetadata, id, method string, params any) ([]byte, error) {
+	stream, closeStream, err := openRuntimeRequest(ctx, metadata, id, method, params, false)
+	if err != nil {
 		return nil, err
+	}
+	defer closeStream()
+	reader := bufio.NewReader(io.LimitReader(stream, responseLimit))
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if !bytes.HasSuffix(line, []byte{'\n'}) {
+			return nil, errors.New("incomplete Orca response")
+		}
+		// Core emits this frame while a launch waits for its agent to accept the prompt.
+		if !bytes.Equal(bytes.TrimSpace(line), []byte(`{"_keepalive":true}`)) {
+			return line, nil
+		}
+	}
+}
+
+func openRuntimeRequest(ctx context.Context, metadata runtimeMetadata, id, method string, params any, desktop bool) (io.Reader, func(), error) {
+	stream, err := connectOwned(ctx, metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	closeStream := sync.OnceFunc(func() { _ = stream.Close() })
+	stop := context.AfterFunc(ctx, closeStream)
+	closeRequest := func() {
+		stop()
+		closeStream()
+	}
+	if err := ctx.Err(); err != nil {
+		closeRequest()
+		return nil, nil, err
 	}
 
 	request := struct {
-		ID        string `json:"id"`
-		AuthToken string `json:"authToken"`
-		Method    string `json:"method"`
-		Params    any    `json:"params"`
-	}{id, metadata.authToken, method, params}
+		ID           string `json:"id"`
+		AuthToken    string `json:"authToken"`
+		Method       string `json:"method"`
+		Params       any    `json:"params"`
+		QuestionKey  string `json:"wailsQuestionKey,omitempty"`
+		WailsDesktop bool   `json:"wailsDesktop,omitempty"`
+	}{ID: id, AuthToken: metadata.authToken, Method: method, Params: params, WailsDesktop: desktop}
+	switch {
+	case desktop, method == "agentSession.history", method == "agentSession.item",
+		method == "agentSession.respondToQuestion", method == "agent.read":
+		request.QuestionKey, _ = ctx.Value(desktopQuestionKeyContext{}).(string)
+	}
 	if err := json.NewEncoder(stream).Encode(request); err != nil {
-		return nil, err
+		closeRequest()
+		return nil, nil, err
 	}
+	return stream, closeRequest, nil
+}
 
-	line, err := bufio.NewReader(io.LimitReader(stream, responseLimit)).ReadBytes('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+type LocalSubscription struct {
+	ctx       context.Context
+	reader    *bufio.Scanner
+	runtimeID string
+	close     func()
+}
+
+const desktopRequestID = "wails-desktop"
+
+func SubscribeLocal(ctx context.Context, data string, pid uint32, method string, params json.RawMessage) (*LocalSubscription, error) {
+	metadata, err := runtimeFor(ctx, data, pid)
+	if err != nil {
 		return nil, err
 	}
-	if !bytes.HasSuffix(line, []byte{'\n'}) {
-		return nil, errors.New("incomplete Orca response")
+	stream, closeRequest, err := openRuntimeRequest(ctx, metadata, desktopRequestID, method, params, true)
+	if err != nil {
+		return nil, err
 	}
-	return line, nil
+	reader := bufio.NewScanner(stream)
+	reader.Buffer(make([]byte, 32<<10), responseLimit)
+	return &LocalSubscription{ctx, reader, metadata.runtimeID, closeRequest}, nil
+}
+
+func (s *LocalSubscription) Close() { s.close() }
+
+func (s *LocalSubscription) Next() (json.RawMessage, error) {
+	for s.ctx.Err() == nil && s.reader.Scan() {
+		frame := s.reader.Bytes()
+		if bytes.Equal(frame, []byte(`{"_keepalive":true}`)) {
+			continue
+		}
+		if bytes.Equal(frame, []byte(`{"_wailsDone":true}`)) {
+			return nil, io.EOF
+		}
+		var id string
+		var ok bool
+		var meta responseMeta
+		if err := decodeObject(frame, required("id", &id), required("ok", &ok), required("_meta", &meta)); err != nil {
+			return nil, err
+		}
+		if id != desktopRequestID || meta.runtimeID != s.runtimeID {
+			return nil, errors.New("response belongs to another Orca request or runtime")
+		}
+		return bytes.Clone(frame), nil
+	}
+	if err := s.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.reader.Err(); err != nil {
+		return nil, err
+	}
+	return nil, io.EOF
 }
 
 func (m runtimeMetadata) endpoint(kind string) (string, bool) {

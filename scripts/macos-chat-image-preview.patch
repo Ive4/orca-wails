@@ -1,0 +1,204 @@
+diff --git a/src/renderer/src/runtime/files/grants/runtime-granted-file-paged-read.test.ts b/src/renderer/src/runtime/files/grants/runtime-granted-file-paged-read.test.ts
+index 25c832b..8fcd491 100644
+--- a/src/renderer/src/runtime/files/grants/runtime-granted-file-paged-read.test.ts
++++ b/src/renderer/src/runtime/files/grants/runtime-granted-file-paged-read.test.ts
+@@ -1,7 +1,8 @@
+-import { describe, expect, it } from 'vitest'
+-import { readRuntimeFileContent } from '../reads/runtime-file-read-client'
++import { describe, expect, it, vi } from 'vitest'
++import { readRuntimeFileContent, readRuntimeFilePreview } from '../reads/runtime-file-read-client'
+ import { readRuntimeFileBytes } from '../reads/runtime-paged-file-read'
+ import {
++  runtimeCall,
+   runtimeEnvironmentCall,
+   fsGrantRuntimeFilePreview,
+   installRuntimeFileClientEnvironment
+@@ -105,6 +106,97 @@ describe('a granted host file outside every workspace', () => {
+     expect(read.readOnly).toBe(true)
+   })
+ 
++  it('returns bytes for a chat image outside the workspace when it exceeds one reply', async () => {
++    const path = '/tmp/console.png'
++    const bytes = Buffer.alloc(3_300_000, 0x4d)
++    const meta = { runtimeId: 'remote-runtime' }
++    const ok = (result: unknown) => ({ id: 'rpc', ok: true, result, _meta: meta })
++    fsGrantRuntimeFilePreview.mockResolvedValue({
++      isBinary: true,
++      content: '',
++      mimeType: 'image/png',
++      mediaUrl: 'orca-media://file/t'
++    })
++    runtimeEnvironmentCall.mockImplementation(
++      async (args: { method: string; params?: unknown }) => {
++        switch (args.method) {
++          case 'files.resolveTerminalPath':
++            return ok({
++              worktree: 'wt-1',
++              relativePath: null,
++              absolutePath: path,
++              exists: true,
++              isDirectory: false,
++              openTarget: {
++                kind: 'absolute-file',
++                provider: 'local',
++                absolutePath: path,
++                grantId: 'g-1'
++              }
++            })
++          case 'files.readTerminalArtifact':
++          case 'files.readTerminalArtifactPreview':
++            return {
++              id: 'rpc',
++              ok: false,
++              error: {
++                code: 'runtime_error',
++                message:
++                  args.method === 'files.readTerminalArtifact' ? 'binary_file' : 'file_too_large'
++              },
++              _meta: meta
++            }
++          case 'files.statTerminalArtifact':
++            return ok({ size: 3_300_000, isDirectory: false, mtime: 1, ctime: 1 })
++          case 'files.readTerminalArtifactChunk': {
++            const { offset, length } = chunkRangeOf(args.params)
++            const chunk = bytes.subarray(offset, offset + length)
++            return ok({
++              contentBase64: chunk.toString('base64'),
++              bytesRead: chunk.length,
++              eof: offset + length >= 3_300_000
++            })
++          }
++          default:
++            throw new Error(`unexpected ${args.method}`)
++        }
++      }
++    )
++
++    const preview = await readRuntimeFilePreview(
++      { target: granted.target, worktreeId: 'wt-1', worktreePath: '/repo' },
++      path,
++      { kind: 'chat-image' }
++    )
++    expect(preview).toMatchObject({ isBinary: true, mimeType: 'image/png' })
++    expect(Buffer.from(preview.content, 'base64').equals(bytes)).toBe(true)
++  })
++
++  it('uses the desktop Core to preview an image outside the local workspace', async () => {
++    vi.stubGlobal('__orcaWailsDesktop', { protocol: 1 })
++    const path = '/tmp/console.png'
++    const preview = { content: 'iVBORw0KGgo=', isBinary: true, mimeType: 'image/png' }
++    runtimeCall.mockImplementation((request: unknown) => {
++      expect(request).toEqual({
++        method: 'files.readChatImage',
++        params: { worktree: 'id:wt-1', path }
++      })
++      return { id: 'rpc', ok: true, result: preview, _meta: { runtimeId: 'local-runtime' } }
++    })
++
++    try {
++      await expect(
++        readRuntimeFilePreview(
++          { target: { kind: 'local' }, worktreeId: 'wt-1', worktreePath: '/repo' },
++          path,
++          { kind: 'chat-image' }
++        )
++      ).resolves.toEqual({ content: 'iVBORw0KGgo=', isBinary: true, mimeType: 'image/png' })
++    } finally {
++      Reflect.deleteProperty(globalThis, '__orcaWailsDesktop')
++    }
++  })
++
+   // Why: a bytes editor pages the file with the grant that served it, not the one that lapsed.
+   it('reports the grant it renewed to read a lapsed one', async () => {
+     const meta = { runtimeId: 'remote-runtime' }
+diff --git a/src/renderer/src/runtime/files/grants/runtime-terminal-artifact-read.ts b/src/renderer/src/runtime/files/grants/runtime-terminal-artifact-read.ts
+index b3bfc0a..ed63385 100644
+--- a/src/renderer/src/runtime/files/grants/runtime-terminal-artifact-read.ts
++++ b/src/renderer/src/runtime/files/grants/runtime-terminal-artifact-read.ts
+@@ -22,7 +22,8 @@ export async function readHostFilePreview(
+   }
+   return readRuntimeTerminalArtifactContent(
+     { ...pinned, absolutePath: granted.absolutePath, grantId: granted.grantId },
+-    { pageOversizedBinary: false }
++    // Chat thumbnails consume image bytes, so page them without switching to a media URL.
++    { pageOversizedBinary: true, allowRangePreview: false }
+   )
+ }
+ 
+@@ -62,7 +63,7 @@ export async function readHostFileOutsideWorkspaces(args: {
+ /** Reads a host file outside every workspace through its grant, renewing a lapsed or stale one. */
+ export async function readRuntimeTerminalArtifactContent(
+   unpinned: TerminalArtifactGrantTarget & { grantId: string },
+-  options: { pageOversizedBinary: boolean }
++  options: { pageOversizedBinary: boolean; allowRangePreview?: boolean }
+ ): Promise<RuntimeReadableFileContent> {
+   const args = pinTerminalArtifactGrantTarget(unpinned)
+   try {
+@@ -83,7 +84,7 @@ export async function readRuntimeTerminalArtifactContent(
+ 
+ async function readThroughGrant(
+   args: TerminalArtifactGrantTarget & { grantId: string },
+-  options: { pageOversizedBinary: boolean }
++  options: { pageOversizedBinary: boolean; allowRangePreview?: boolean }
+ ): Promise<RuntimeReadableFileContent> {
+   const content = await readRemoteFileContent(
+     {
+diff --git a/src/renderer/src/runtime/files/reads/runtime-file-read-client.ts b/src/renderer/src/runtime/files/reads/runtime-file-read-client.ts
+index ee4d3b9..dcd1859 100644
+--- a/src/renderer/src/runtime/files/reads/runtime-file-read-client.ts
++++ b/src/renderer/src/runtime/files/reads/runtime-file-read-client.ts
+@@ -1,5 +1,6 @@
+ import type { RuntimeFilePreviewResult } from '../../../../../shared/file-content/runtime-file-read'
+ import { callRuntimeRpc } from '../../rpc/calls/runtime-rpc-call'
++import { toRuntimeWorktreeSelector } from '../../rpc/targets/runtime-worktree-selector'
+ import type {
+   RuntimeFileDownloadResult,
+   RuntimeFileOperationArgs,
+@@ -24,6 +25,7 @@ import {
+ } from '../grants/runtime-terminal-artifact-read'
+ import { readRemoteFilePreview } from './runtime-paged-file-read'
+ import { downloadRemoteRuntimeFile } from './runtime-remote-file-download'
++import { getWailsDesktopBridge } from '@/wails/local-runtime'
+ 
+ /** SVG opens as editable markup; hosts send it as image bytes, or as a URL if a viewer asks. */
+ export async function readRuntimeFileContent(
+@@ -105,6 +107,18 @@ export async function readRuntimeFilePreview(
+   )
+   const remoteArgs = getRemoteFileArgs(context, filePath)
+   const { target: runtimeTarget, worktreeId } = context
++  if (
++    access?.kind === 'chat-image' &&
++    runtimeTarget.kind === 'local' &&
++    worktreeId &&
++    !context.connectionId &&
++    getWailsDesktopBridge()
++  ) {
++    return callRuntimeRpc<RuntimeFilePreviewResult>(runtimeTarget, 'files.readChatImage', {
++      worktree: toRuntimeWorktreeSelector(worktreeId),
++      path: filePath
++    })
++  }
+   // Paired-server chat attachments live outside worktrees; owning server reads them. Older method_not_found keeps preview fallback.
+   if (
+     !remoteArgs &&
+diff --git a/src/renderer/src/runtime/files/reads/runtime-remote-file-content.ts b/src/renderer/src/runtime/files/reads/runtime-remote-file-content.ts
+index b66cd48..e05a62e 100644
+--- a/src/renderer/src/runtime/files/reads/runtime-remote-file-content.ts
++++ b/src/renderer/src/runtime/files/reads/runtime-remote-file-content.ts
+@@ -21,11 +21,14 @@ function isRpcRefusal(error: unknown, message: string): boolean {
+ /** A paired runtime's file for the editor: streamed to a viewer by URL, previewed, or paged past one reply. */
+ export async function readRemoteFileContent(
+   address: RuntimeRemoteFileAddress,
+-  { pageOversizedBinary }: { pageOversizedBinary: boolean }
++  {
++    pageOversizedBinary,
++    allowRangePreview = pageOversizedBinary
++  }: { pageOversizedBinary: boolean; allowRangePreview?: boolean }
+ ): Promise<RuntimeReadableFileContent> {
+   const remote = pinRemoteFileAddress(address)
+   // Baseline checks discard binary content, so only readers that render bytes mint a stream.
+-  const rangePreview = pageOversizedBinary ? await readRemoteRangePreview(remote) : null
++  const rangePreview = allowRangePreview ? await readRemoteRangePreview(remote) : null
+   if (rangePreview) {
+     return rangePreview
+   }

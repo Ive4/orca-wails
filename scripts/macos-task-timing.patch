@@ -1,0 +1,282 @@
+diff --git a/src/shared/agent-session/view/structured-agent-session-turn-timing.ts b/src/shared/agent-session/view/structured-agent-session-turn-timing.ts
+--- a/src/shared/agent-session/view/structured-agent-session-turn-timing.ts
++++ b/src/shared/agent-session/view/structured-agent-session-turn-timing.ts
+@@ -150,6 +150,12 @@
+     : null
+ }
+ 
++export function completedStructuredAgentTurnItemSeconds(
++  item: Pick<AgentJournalRenderItem, 'body' | 'observedAt'>
++): number | null {
++  return completedStructuredAgentTurnSeconds(readTiming(item))
++}
++
+ /** Convert elapsed host-only differences onto the client’s firstSeen clock to avoid skew. With hostNow, include pre-attach elapsed;
+  * otherwise subtract only known start-to-append lag. Never subtract timestamps from different clocks. */
+ export function structuredAgentTurnLocalStartedAt(
+diff --git a/src/shared/agent-session/requests/structured-agent-session-latest-request.ts b/src/shared/agent-session/requests/structured-agent-session-latest-request.ts
+--- a/src/shared/agent-session/requests/structured-agent-session-latest-request.ts
++++ b/src/shared/agent-session/requests/structured-agent-session-latest-request.ts
+@@ -18,6 +18,7 @@
+   readAgentJournalTurn,
+   readAgentJournalTurnOutcome
+ } from '../lifecycle/records/agent-session-turn-record'
++import { completedStructuredAgentTurnItemSeconds } from '../view/structured-agent-session-turn-timing'
+ import { classifyDispatchRejection } from './structured-agent-session-dispatch-rejection'
+ import { withoutNativeChatVisualDirectiveLines } from '../../native-chat/visuals/native-chat-visual-directive'
+ import { isUnansweredStructuredAgentSessionDispatch } from './structured-agent-session-unanswered-dispatch'
+@@ -43,6 +44,8 @@
+   outcome: AgentJournalTurnOutcome | null
+   /** When it settled: the turn's end, or the refusal. Undefined while it runs. */
+   settledAt: number | undefined
++  completedAt?: number
++  completedDurationSeconds?: number
+   /** The agent opened this turn itself (e.g. woken by a background task) and the user steered nothing into it. */
+   selfStarted?: true
+ }
+@@ -104,12 +107,22 @@
+   }
+   const turn = readAgentJournalTurn(item.body)
+   if (turn) {
++    const completedDurationSeconds = completedStructuredAgentTurnItemSeconds(item)
++    const completedAt =
++      (turn.state === 'completed' || turn.state === 'interrupted') &&
++      turn.completedAt !== undefined &&
++      Number.isSafeInteger(turn.completedAt) &&
++      turn.completedAt > 0
++        ? turn.completedAt
++        : undefined
+     return {
+       kind: 'turn',
+       id: turn.turnId,
+       turnState: turn.state,
+       outcome: readAgentJournalTurnOutcome(turn),
+       settledAt: turn.state === 'running' ? undefined : turnEndedAt(item, turn),
++      ...(completedAt !== undefined ? { completedAt } : {}),
++      ...(completedDurationSeconds !== null ? { completedDurationSeconds } : {}),
+       ...(turn.userItemId === item.itemId && !steered(item.itemId)
+         ? { selfStarted: true as const }
+         : {})
+diff --git a/src/shared/agent-session/agent-session-wire.ts b/src/shared/agent-session/agent-session-wire.ts
+--- a/src/shared/agent-session/agent-session-wire.ts
++++ b/src/shared/agent-session/agent-session-wire.ts
+@@ -278,6 +278,8 @@
+   updatedAt: number
+   /** Date the lead status by its own lifecycle edge, never updatedAt (child rows change it). Missing/older-host dates leave readers tracking time themselves. */
+   statusStartedAt?: number
++  completedAt?: number
++  completedDurationSeconds?: number
+ } & AgentSessionStatusPermissionFields
+ 
+ /** `failedAt` dates the run, so a repeat failure with the same message still republishes. */
+diff --git a/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary.ts b/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary.ts
+--- a/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary.ts
++++ b/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary.ts
+@@ -61,6 +61,7 @@
+   now: () => number
+ }): AgentSessionStatusSummary {
+   const { openAsyncQuestion, ...projected } = state.summary
++  const completion = projected.status === 'idle' ? state.latestRequest : undefined
+   const skippedThrough = record?.asyncQuestionsSkippedThrough
+   const providerSession = structuredAgentSessionProviderSessionMetadata(record)
+   // Acknowledged record options remain authoritative across model switches.
+@@ -88,6 +89,10 @@
+       : {}),
+     ...(session.restartResume ? { restartResume: { phase: session.restartResume.phase } } : {}),
+     ...projected,
++    ...(completion?.completedAt !== undefined ? { completedAt: completion.completedAt } : {}),
++    ...(completion?.completedDurationSeconds !== undefined
++      ? { completedDurationSeconds: completion.completedDurationSeconds }
++      : {}),
+     ...(structuredAgentSessionAwaitsAnswer(openAsyncQuestion, skippedThrough)
+       ? { awaitsAnswer: true as const, awaitsQuestion: openAsyncQuestion }
+       : {}),
+diff --git a/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary-equality.ts b/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary-equality.ts
+--- a/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary-equality.ts
++++ b/src/main/native-chat/agent-session-wire/observations/structured-agent-session-status-summary-equality.ts
+@@ -24,6 +24,8 @@
+     a.rewindBlockedReason === b.rewindBlockedReason &&
+     // State clocks affect ranking; undated idle/live-child rows also use publication time as evidence.
+     a.statusStartedAt === b.statusStartedAt &&
++    a.completedAt === b.completedAt &&
++    a.completedDurationSeconds === b.completedDurationSeconds &&
+     (a.status !== 'idle' ||
+       a.updatedAt === b.updatedAt ||
+       (a.statusStartedAt !== undefined && !isIdleHeldOpenByChildWork(b))) &&
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts
+@@ -29,6 +29,8 @@
+   interrupted: boolean
+   mainAgent?: AgentMainAgentStatus
+   stateStartedAt: number
++  completedAt?: number
++  completedDurationSeconds?: number
+   updatedAt: number
+   /** Projected by the structured session host; `owned` rows stay fresh past the staleness window. */
+   structuredHost?: StructuredHostStatus
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts
+@@ -26,10 +26,10 @@
+ }
+ 
+ /** Join only the host-owned summary of this exact chat, never a remote pane with a similar id. */
+-function publishedStructuredChildren(
++function publishedStructuredSummary(
+   entry: AgentStatusIpcPayload,
+   read: ((sessionId: string) => AgentSessionStatusSummary | undefined) | undefined
+-) {
++): AgentSessionStatusSummary | undefined {
+   const tabId = entry.tabId
+   const sessionId = tabId ? structuredAgentSessionIdFromTabId(tabId) : null
+   if (!read || !entry.structuredHost || entry.connectionId !== null || !tabId || !sessionId) {
+@@ -39,7 +39,31 @@
+     return undefined
+   }
+   const summary = read(sessionId)
+-  return summary?.workspaceId === entry.worktreeId ? (summary?.children ?? []) : undefined
++  return summary?.workspaceId === entry.worktreeId ? summary : undefined
++}
++
++function completedTiming(
++  entry: AgentStatusIpcPayload,
++  summary: AgentSessionStatusSummary | undefined
++): Pick<RuntimeWorktreeAgentSource, 'completedAt' | 'completedDurationSeconds'> {
++  if (entry.state !== 'done') {
++    return {}
++  }
++  if (entry.structuredHost) {
++    if (summary?.status !== 'idle' || summary.statusStartedAt !== entry.stateStartedAt) {
++      return {}
++    }
++    return {
++      ...(summary.completedAt !== undefined ? { completedAt: summary.completedAt } : {}),
++      ...(summary.completedDurationSeconds !== undefined
++        ? { completedDurationSeconds: summary.completedDurationSeconds }
++        : {})
++    }
++  }
++  // A terminal's identified end does not establish that its reported start belongs to that turn.
++  return entry.turnEndDisposition === 'identified' && entry.turnEndedAt !== undefined
++    ? { completedAt: entry.turnEndedAt }
++    : {}
+ }
+ 
+ /** Admit hook-server rows using their execution-host evidence. */
+@@ -70,7 +94,8 @@
+       continue
+     }
+     const hookPayload = pickParsedAgentStatusPayload(entry)
+-    const children = publishedStructuredChildren(entry, args.readStructuredSummary)
++    const structured = publishedStructuredSummary(entry, args.readStructuredSummary)
++    const children = structured ? (structured.children ?? []) : undefined
+     const terminalHandle =
+       entry.terminalHandle ??
+       (entry.structuredHost
+@@ -107,6 +132,7 @@
+       interrupted: false,
+       ...agentVerdictFields(entry),
+       stateStartedAt: entry.stateStartedAt,
++      ...completedTiming(entry, structured),
+       // A replay advances delivery order, not the age of the evidence shown by worktree.ps.
+       updatedAt: entry.evidenceObservedAt ?? entry.receivedAt,
+       ...(children !== undefined ? { children } : {}),
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts
+@@ -131,6 +131,10 @@
+       interrupted: source.interrupted,
+       ...(source.mainAgent ? { mainAgent: source.mainAgent } : {}),
+       stateStartedAt: source.stateStartedAt,
++      ...(source.completedAt !== undefined ? { completedAt: source.completedAt } : {}),
++      ...(source.completedDurationSeconds !== undefined
++        ? { completedDurationSeconds: source.completedDurationSeconds }
++        : {}),
+       updatedAt: source.updatedAt,
+       ...(source.children !== undefined ? { children: source.children } : {}),
+       ...(source.subagents !== undefined ? { subagents: source.subagents } : {}),
+diff --git a/src/shared/worktree/catalog/runtime-worktree-contracts.ts b/src/shared/worktree/catalog/runtime-worktree-contracts.ts
+--- a/src/shared/worktree/catalog/runtime-worktree-contracts.ts
++++ b/src/shared/worktree/catalog/runtime-worktree-contracts.ts
+@@ -61,6 +61,10 @@
+   /** Same as `terminal show`, only when requested: null is "looked, no wait"; absent is not evaluated (structured workers, old hosts). */
+   agentWait?: RuntimeTerminalInteractiveWait | null
+   stateStartedAt: number
++  /** The host-recorded end of the latest settled turn, when known. */
++  completedAt?: number
++  /** Whole seconds from the host's latest settled turn, when known. */
++  completedDurationSeconds?: number
+   updatedAt: number
+   /** Native canonical views win over the CLI roster, including an explicit empty list. */
+   children?: AgentChildWorkView[]
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts
+@@ -122,7 +122,8 @@
+         ptyIdByTerminalHandle: new Map(),
+         terminalHandleByPaneKey: new Map()
+       },
+-      hookSnapshots
++      hookSnapshots,
++      readStructuredSummary: (id) => (id === summary.sessionId ? summary : undefined)
+     }),
+     orchestrationByPaneKey: null,
+     getSummary: (id) => summaries.get(id) ?? null
+@@ -161,6 +162,29 @@
+       state: 'done',
+       mainAgent: { state: 'done', outcome: 'failure' },
+       interrupted: false
++    })
++  })
++
++  it('lists the timestamp and duration of the same completed journal turn', async () => {
++    const journal = await openJournal()
++    await journal.appendItem(
++      TURN_IDENTITY,
++      {
++        kind: 'turn',
++        turnId: 'turn-1',
++        state: 'completed',
++        startedAt: 1_000,
++        completedAt: 523_000
++      },
++      { fence: 1, turnScope: AGENT_JOURNAL_THREAD_SCOPE }
++    )
++
++    const summary = await publishedSummary(journal)
++    expect(summary).toMatchObject({ completedAt: 523_000, completedDurationSeconds: 522 })
++    expect(ingest(summary).ps).toMatchObject({
++      state: 'done',
++      completedAt: 523_000,
++      completedDurationSeconds: 522
+     })
+   })
+ 
+@@ -180,6 +204,7 @@
+ 
+     const { status, ps } = ingest(await publishedSummary(journal))
+     expect(status).toMatchObject({ state: 'done', interrupted: true })
++    expect(ps).not.toHaveProperty('completedDurationSeconds')
+     expect(ps).toMatchObject({
+       mainAgent: { state: 'done', outcome: 'cancellation' },
+       interrupted: true
+diff --git a/src/main/native-chat/agent-session-journal/journal-status-requests.test.ts b/src/main/native-chat/agent-session-journal/journal-status-requests.test.ts
+--- a/src/main/native-chat/agent-session-journal/journal-status-requests.test.ts
++++ b/src/main/native-chat/agent-session-journal/journal-status-requests.test.ts
+@@ -92,6 +92,7 @@
+       id: 'done',
+       turnState: 'completed',
+       outcome: 'success',
++      completedAt: 100,
+       settledAt: 100
+     },
+     lastAssistantMessage: 'Root reply'
+@@ -116,6 +117,7 @@
+       id: 'compact',
+       turnState: 'completed',
+       outcome: 'failure',
++      completedAt: 110,
+       settledAt: 110
+     }
+   })

@@ -5,6 +5,20 @@ import UserNotifications
 
 @MainActor
 final class Notifications: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+    enum TaskSound: String, CaseIterable, Decodable {
+        case started, resumed, finished, waiting, blocked
+
+        var title: String {
+            switch self {
+            case .started: "任务开始"
+            case .resumed: "任务恢复"
+            case .finished: "任务结束"
+            case .waiting: "等待输入"
+            case .blocked: "任务受阻"
+            }
+        }
+    }
+
     private enum Key {
         static let task = "orca.task"
         static let general = "orca.general"
@@ -16,7 +30,10 @@ final class Notifications: NSObject, ObservableObject, UNUserNotificationCenterD
     @Published private(set) var canRequest = false
     @Published private(set) var authorized = false
     @Published var sound = UserDefaults.standard.object(forKey: "orca.notificationSound") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(sound, forKey: "orca.notificationSound") }
+        didSet {
+            UserDefaults.standard.set(sound, forKey: "orca.notificationSound")
+            if !sound { stopTaskSounds() }
+        }
     }
     var onOpen: ((String?) -> Void)?
     private let center = UNUserNotificationCenter.current()
@@ -24,6 +41,9 @@ final class Notifications: NSObject, ObservableObject, UNUserNotificationCenterD
     private var enabled = true
     private var attention = 0
     private var revisions: [String: UUID] = [:]
+    private var playingTaskSound: NSSound?
+    private var pendingTaskSounds: [TaskSound] = []
+    private var taskSoundPlayback: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -42,6 +62,7 @@ final class Notifications: NSObject, ObservableObject, UNUserNotificationCenterD
         self.enabled = enabled
         self.attention = attention
         if !enabled {
+            stopTaskSounds()
             revisions.removeAll()
             center.removeAllPendingNotificationRequests()
             center.removeAllDeliveredNotifications()
@@ -82,6 +103,38 @@ final class Notifications: NSObject, ObservableObject, UNUserNotificationCenterD
         }
     }
 
+    func playTaskSounds(_ cues: [TaskSound]) {
+        guard enabled, sound else { return }
+        for cue in cues where !pendingTaskSounds.contains(cue) {
+            pendingTaskSounds.append(cue)
+        }
+        guard taskSoundPlayback == nil, !pendingTaskSounds.isEmpty else { return }
+        taskSoundPlayback = Task {
+            while !Task.isCancelled, !pendingTaskSounds.isEmpty {
+                let cue = pendingTaskSounds.removeFirst()
+                guard let url = Bundle.main.url(forResource: cue.rawValue, withExtension: "wav", subdirectory: "TaskSounds"),
+                      let clip = NSSound(contentsOf: url, byReference: true), clip.play() else {
+                    logger.error("Could not play task sound \(cue.rawValue)")
+                    continue
+                }
+                playingTaskSound = clip
+                do { try await Task.sleep(for: .seconds(clip.duration) + .milliseconds(75)) }
+                catch { return }
+            }
+            guard !Task.isCancelled else { return }
+            playingTaskSound = nil
+            taskSoundPlayback = nil
+        }
+    }
+
+    private func stopTaskSounds() {
+        taskSoundPlayback?.cancel()
+        taskSoundPlayback = nil
+        pendingTaskSounds.removeAll()
+        playingTaskSound?.stop()
+        playingTaskSound = nil
+    }
+
     func send(title: String, body: String, taskID: String? = nil, group: String = Key.general) {
         guard enabled else { return }
         let revision = UUID()
@@ -96,7 +149,8 @@ final class Notifications: NSObject, ObservableObject, UNUserNotificationCenterD
             content.threadIdentifier = group
             content.categoryIdentifier = taskID == nil ? Key.general : Key.task
             if let taskID { content.userInfo = ["taskID": taskID] }
-            if sound && settings.soundSetting == .enabled { content.sound = .default }
+            // The task transition already played its own cue.
+            if taskID == nil, sound, settings.soundSetting == .enabled { content.sound = .default }
             let identifier = taskID.map { "orca.task.\($0)" } ?? revision.uuidString
             // Replace an older delivered alert for this task when its attention state changes.
             if taskID != nil { center.removeDeliveredNotifications(withIdentifiers: [identifier]) }

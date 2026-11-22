@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +24,7 @@ import (
 	"orca-wails/internal/core"
 	"orca-wails/internal/tasks"
 	"orca-wails/internal/update"
+	"orca-wails/internal/wechat"
 )
 
 const appName = "Orca-Wails"
@@ -69,9 +70,12 @@ type desktop struct {
 	autostart         bool
 	notifications     bool
 	entries           macOSEntries
+	computerUse       computerUseSettings
 	nativeTray        bool
 	nativeTrayMu      sync.Mutex
 	nativeTrayDetails *trayVersions
+	wechat            *wechat.Service
+	desktopAccessKey  string
 
 	window           atomic.Pointer[orcaWindow]
 	panel            atomic.Pointer[trayPanel]
@@ -127,6 +131,7 @@ func run(opts launchOptions) error {
 	defer cancel()
 	d := &desktop{
 		ctx: ctx, cancel: cancel, seed: bootstrap, launch: opts, retryTasks: make(chan struct{}, 1),
+		desktopAccessKey: hex.EncodeToString(randomToken()),
 	}
 	d.app = application.New(application.Options{
 		Name: appName, Description: "独立 Orca Core 的桌面宿主", Icon: appIcon,
@@ -178,6 +183,7 @@ func run(opts launchOptions) error {
 	d.autostart = autostartEnabled()
 	d.notifications = d.cfg.Notifications
 	d.entries = d.cfg.MacOSEntries
+	d.computerUse = d.cfg.computerUseSettings
 	if err := d.configureAppUpdater(); err != nil {
 		return err
 	}
@@ -186,6 +192,8 @@ func run(opts launchOptions) error {
 	d.nativeTray = d.startNativeTray()
 	if !d.nativeTray {
 		d.configureTray()
+	} else {
+		d.openWeChat()
 	}
 	d.app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(_ *application.ApplicationEvent) {
 		go d.start(opts.Background)
@@ -201,10 +209,15 @@ func run(opts launchOptions) error {
 
 func (d *desktop) start(background bool) {
 	d.refreshNativeTray(true)
-	shortcut := strings.ReplaceAll(strings.ToLower(d.cfg.GlobalShortcut), "commandorcontrol", "cmdorctrl")
+	if d.wechat != nil {
+		d.wechat.Resume()
+	}
+	d.settingsMu.Lock()
+	shortcut := trayShortcutName(d.cfg.GlobalShortcut)
 	if err := d.app.GlobalShortcut.Register(shortcut, func() { d.request("toggle", nil) }); err != nil {
 		d.setMessage("全局快捷键不可用：" + err.Error())
 	}
+	d.settingsMu.Unlock()
 	signals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	go func() {
 		defer stopSignals()

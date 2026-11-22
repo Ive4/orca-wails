@@ -5,10 +5,14 @@ package core
 import (
 	"errors"
 	"os"
+	"slices"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+const questionKeyFDEnv = "ORCA_WAILS_QUESTION_KEY_FD"
 
 // A private Unix process group owns descendants that stay in the group.
 type platformProcess struct {
@@ -20,12 +24,36 @@ type platformProcess struct {
 }
 
 func spawn(spec Spec, stdin, stdout, stderr *os.File) (*platformProcess, error) {
+	env := slices.DeleteFunc(runtimeEnvironment(spec.Env, false), func(entry string) bool {
+		return strings.HasPrefix(entry, questionKeyFDEnv+"=")
+	})
+	files := []*os.File{stdin, stdout, stderr}
+	if key := spec.DesktopQuestionKey; key != "" {
+		if len(key) != 64 || strings.IndexFunc(key, func(c rune) bool {
+			return !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f')
+		}) >= 0 {
+			return nil, errors.New("invalid desktop question key")
+		}
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return nil, errors.New("could not create desktop question key pipe")
+		}
+		defer reader.Close()
+		_, writeErr := writer.WriteString(key)
+		closeErr := writer.Close()
+		if writeErr != nil || closeErr != nil {
+			return nil, errors.New("could not prepare desktop question key pipe")
+		}
+		files = append(files, reader)
+		env = append(env, questionKeyFDEnv+"=3")
+	}
+
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	configureParentDeath(attr)
 	process, err := os.StartProcess(spec.Program, append([]string{spec.Program}, spec.Args...), &os.ProcAttr{
 		Dir:   spec.Dir,
-		Env:   runtimeEnvironment(spec.Env, false),
-		Files: []*os.File{stdin, stdout, stderr},
+		Env:   env,
+		Files: files,
 		Sys:   attr,
 	})
 	if err != nil {

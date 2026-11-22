@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import re
 import runpy
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -19,22 +21,25 @@ from upstream_cache import ROOT, cache_dir, fetch_pinned, fetch_source, file_dig
 
 VERSION_FILE = ROOT / 'core-version.macos-arm64.json'
 INVENTORY_SOURCE = 'src/shared/remote-runtime/orcad-distribution/orcad-artifacts.ts'
+COMPUTER_HELPER = 'Orca Computer Use.app'
+COMPUTER_HELPER_ID = 'dev.orca-wails.computer-use'
 SQLITE_MIN_MACOS = '13.5'
 DATA_PLUGIN_BUNDLE = r"""
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
-  buildOrcadEntry, buildOrcadWorker, ORCAD_CHILD_ENTRY_POINTS, orcadChildOutputFilename,
+  buildOrcadCli, buildOrcadEntry, buildOrcadWorker, ORCAD_CHILD_ENTRY_POINTS, orcadChildOutputFilename,
 } from './config/scripts/orcad-distribution/server-bundle/orcad-entry-build.mjs';
 
 const server = process.argv[1];
 const slot = dirname(server);
 const workers = Object.values(ORCAD_CHILD_ENTRY_POINTS)
   .map(entry => [entry, orcadChildOutputFilename(entry)])
-  .filter(([, filename]) => !existsSync(join(slot, filename)));
+  .filter(([, filename]) => filename === 'computer-sidecar.js' || !existsSync(join(slot, filename)));
 workers.push(['src/main/plugins/workers/plugin-host-entry.ts', 'plugin-host-entry.js']);
 await Promise.all([
   buildOrcadEntry(server),
+  buildOrcadCli(join(slot, 'out/cli/index.js')),
   ...workers.map(([entry, filename]) => buildOrcadWorker(entry, join(slot, filename))),
 ]);
 process.stdout.write(JSON.stringify(workers.map(([, filename]) => filename).sort()));
@@ -90,6 +95,27 @@ def copy_resource(source, destination, digest=None):
     shutil.copy2(source, destination)
 
 
+def build_computer_helper(checkout, helper, env):
+    package = checkout / 'native/computer-use-macos'
+    subprocess.run(['/usr/bin/xcrun', 'swift', 'build', '-c', 'release', '--package-path', package,
+                    '--triple', 'arm64-apple-macosx', '--build-system', 'native'],
+                   env=env, check=True, timeout=300)
+    binary = 'orca-computer-use-macos'
+    copy_resource(package / '.build/arm64-apple-macosx/release' / binary, helper / 'Contents/MacOS' / binary)
+    plist = helper / 'Contents/Info.plist'
+    info = plistlib.loads(plist.read_bytes())
+    name = 'Orca Wails Computer Use'
+    info.update(CFBundleIdentifier=COMPUTER_HELPER_ID, CFBundleName=name, CFBundleDisplayName=name)
+    plist.write_bytes(plistlib.dumps(info))
+    identity = os.environ.get('ORCA_WAILS_SIGN_IDENTITY') or '-'
+    options = []
+    if identity != '-':
+        options = (['--timestamp=none'] if os.environ.get('ORCA_WAILS_LOCAL_SIGNING') == '1'
+                   else ['--options', 'runtime', '--timestamp'])
+    subprocess.run(['/usr/bin/codesign', '--force', '--sign', identity, *options, helper], check=True)
+    subprocess.run(['/usr/bin/codesign', '--verify', '--strict', helper], check=True)
+
+
 def stage_bun(lock, work, stage, bun_archive, sqlite_archive, cache):
     pin = lock['bun']
     version = pin['version']
@@ -136,6 +162,38 @@ def stage_bun(lock, work, stage, bun_archive, sqlite_archive, cache):
     return bun
 
 
+def stage_cua_driver(pin, stage, cache):
+    version = pin['version']
+    asset = f'cua-driver-rs-{version}-darwin-arm64'
+    archive = fetch_pinned(
+        f'https://github.com/trycua/cua/releases/download/cua-driver-rs-v{version}/{asset}.tar.gz',
+        pin['archive_sha256'], cache, timeout=900,
+    )
+    runtime = stage / f'runtimes/cua-driver-{version}'
+    runtime.mkdir(parents=True)
+    # Keep the original app bundle and signing requirement for macOS permissions.
+    subprocess.run(['/usr/bin/tar', '-xzf', archive, '--strip-components=1', '-C', runtime,
+                    f'{asset}/CuaDriver.app', f'{asset}/LICENSE', f'{asset}/THIRD_PARTY_NOTICES.md'],
+                   check=True, timeout=60)
+    (runtime / 'LICENSE').replace(stage / 'licenses/CUA-DRIVER-LICENSE')
+    (runtime / 'THIRD_PARTY_NOTICES.md').replace(stage / 'licenses/CUA-DRIVER-THIRD-PARTY-NOTICES.md')
+    return runtime / 'CuaDriver.app/Contents/MacOS/cua-driver'
+
+
+def install_web_dependencies(pnpm, checkout, env):
+    command = [*pnpm, 'install', '--frozen-lockfile', '--ignore-scripts']
+    for attempt in range(3):
+        result = subprocess.run(command, cwd=checkout, env=env, stderr=subprocess.PIPE,
+                                text=True, errors='replace', timeout=1200)
+        sys.stderr.write(result.stderr)
+        if result.returncode == 0:
+            return
+        if attempt == 2 or not ('running updateConfig hook' in result.stderr
+                                and 'Broken pipe' in result.stderr):
+            result.check_returncode()
+        print('Retrying pnpm install after its updateConfig worker lost the pipe.', file=sys.stderr)
+
+
 def build_data_plugin_core(args, upstream, work, stage):
     source_archive = args.upstream_source_archive
     if source_archive is None:
@@ -158,15 +216,30 @@ def build_data_plugin_core(args, upstream, work, stage):
         'macos-tab-drag.patch',
         'macos-local-runtime.patch',
         'macos-plugin-catalog.patch',
+        'macos-task-timing.patch',
+        'macos-task-output-metrics.patch',
+        'macos-computer-use.patch',
+        'macos-cua-driver.patch',
+        'macos-bot-team.patch',
+        'macos-emulator-pane.patch',
+        'macos-plugin-status-bar.patch',
+        'macos-wechat-task-owner.patch',
+        'macos-local-desktop.patch',
+        'macos-chat-image-preview.patch',
+        'macos-chromium-workspace.patch',
+        'macos-shell-settings.patch',
+        'macos-local-host-regressions.patch',
     ):
         subprocess.run(['/usr/bin/git', 'apply', '--whitespace=error-all', ROOT / 'scripts' / name],
                        cwd=checkout, env={**env, 'GIT_CEILING_DIRECTORIES': str(work)},
                        check=True, timeout=30)
+    for name in ('cua-driver-adapter.mjs', 'cua-driver-local.mjs', 'cua-driver-transport.mjs'):
+        shutil.copyfile(ROOT / 'scripts' / name, checkout / 'src/main/computer' / name)
+    build_computer_helper(checkout, stage / 'orcad' / COMPUTER_HELPER, env)
     env['ORCA_TAURI_SOURCE_COMMIT'] = upstream['commit']
-    # Just upstream’s locked dependencies. Native runtime binaries come from the signed app.
+    # Use upstream's locked dependencies for the Web and Core builds.
     pnpm = ['npm', 'exec', '--yes', '--package=pnpm@12.14.0', '--', 'pnpm']
-    subprocess.run([*pnpm, 'install', '--frozen-lockfile', '--ignore-scripts'],
-                   cwd=checkout, env=env, check=True, timeout=1200)
+    install_web_dependencies(pnpm, checkout, env)
     subprocess.run([*pnpm, 'run', 'build:web'], cwd=checkout, env=env, check=True, timeout=300)
     server = stage / 'orcad/orcad-server.js'
     workers = json.loads(subprocess.check_output(
@@ -177,6 +250,7 @@ def build_data_plugin_core(args, upstream, work, stage):
     digest = hashlib.sha256()
     web = checkout / 'out/web'
     require((web / 'web-index.html').is_file(), 'Built Web entry is missing')
+    require((web / 'wails-index.html').is_file(), 'Built desktop entry is missing')
     for file in sorted(web.rglob('*')):
         if file.is_file():
             relative = file.relative_to(web).as_posix()
@@ -184,6 +258,7 @@ def build_data_plugin_core(args, upstream, work, stage):
             copy_resource(file, safe_path(stage / 'web', relative))
     with server.open('a') as bundled:
         bundled.write(f'\n/* Orca Tauri Web SHA-256 {digest.hexdigest()} */\n')
+        bundled.write(f'/* Orca CLI SHA-256 {file_digest(server.parent / "out/cli/index.js")} */\n')
         for filename in workers:
             bundled.write(f'/* Orca worker {filename} SHA-256 {file_digest(server.with_name(filename))} */\n')
 
@@ -235,6 +310,9 @@ def stage_core(args, lock, work, stage):
         for file, digest in files.items():
             copy_resource(safe_path(source_root, file), safe_path(slot, file), digest)
 
+    # Reuse the verified bundle assets. The rebuilt helper gets its own TCC identity.
+    shutil.copytree(resources / COMPUTER_HELPER, slot / COMPUTER_HELPER)
+
     browser = native['browserName']
     browser_root = resources if native.get('packagedBrowser') else native_root
     copy_resource(safe_path(browser_root, browser), safe_path(slot, browser), native['browserSha256'])
@@ -257,6 +335,7 @@ def stage_core(args, lock, work, stage):
 
     verifier = runpy.run_path(str(ROOT / 'scripts/verify-bun-macos.py'))
     runtime = stage_bun(lock, work, stage, args.bun_archive, args.sqlite_archive, args.cache)
+    cua_driver = stage_cua_driver(lock['cua_driver'], stage, args.cache)
     adapt_bun_slot(slot, runtime, lock, verifier)
 
     source = work / 'orcad-artifacts.ts'
@@ -280,14 +359,18 @@ def stage_core(args, lock, work, stage):
                  '--web-client-root', '{core_dir}/web', '--json'],
         'environment': {'ORCA_USER_DATA': '{data_dir}', 'ORCA_VERSION': version,
                         'ORCA_SERVE_RUNTIME': 'orcad', 'ORCA_TAURI_DISABLE_ELECTRON_BROWSER': '1',
+                        'ORCA_COMPUTER_MACOS_HELPER_APP_PATH': f'{{core_dir}}/orcad/{COMPUTER_HELPER}',
+                        'ORCA_WAILS_CUA_DRIVER_PATH': f'{{core_dir}}/{cua_driver.relative_to(stage).as_posix()}',
                         'ORCA_TAURI_DATA_PLUGINS': '1',
                         'ORCA_TAURI_PLUGIN_VERSION': lock['version'].removeprefix('v'), **runtime_env},
-        'health_path': '/web-index.html', 'ui_path': '/web-index.html',
+        'health_path': '/web-index.html', 'ui_path': '/web-index.html', 'desktop_protocol': 1,
+        'shell_settings': True,
         'upstream_commit': upstream['commit'], 'slot_version': version,
         'plugin_host': 'web-plugins-v2',
         'runtime': 'bun', 'bun_version': lock['bun']['version'],
         'bun_sha256': lock['bun']['executable_sha256'],
     }
+    verifier['verify_cua_driver'](stage, manifest, lock['cua_driver'])
     (stage / 'core-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (stage / 'upstream-lock.json').write_text(json.dumps(lock, indent=2) + '\n')
     profile = work / 'boot-profile'

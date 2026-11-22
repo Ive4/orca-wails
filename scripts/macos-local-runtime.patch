@@ -913,3 +913,32 @@ index 0000000..b570ca0
 +export function isWailsLocalRuntime(environmentId: string | null | undefined): boolean {
 +  return !!environmentId && environmentId === getWailsLocalRuntimeId()
 +}
+diff --git a/src/renderer/src/lib/work-items/linear/linear-linked-issue-refresh.ts b/src/renderer/src/lib/work-items/linear/linear-linked-issue-refresh.ts
+index dd4e115..a155209 100644
+--- a/src/renderer/src/lib/work-items/linear/linear-linked-issue-refresh.ts
++++ b/src/renderer/src/lib/work-items/linear/linear-linked-issue-refresh.ts
+@@ -1,3 +1,4 @@
++import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import '@/store/slices/linear/linear-issue-read'
+ import { useAppStore } from '@/store'
+ import type { RuntimeClientTarget } from '../../../../../shared/remote-runtime/host-catalog/runtime-client-target'
+@@ -86,11 +87,14 @@ export function registerLinearLinkedIssueRefresh(unsubs: (() => void)[]) {
+     }
+   }
+   unsubs.push(owner.dispose)
+-  const stopLocal = window.api.linear?.onLinkedIssueUpdated?.((event) =>
+-    owner.handle({ kind: 'local' }, event)
+-  )
+-  if (stopLocal) {
+-    unsubs.push(stopLocal)
++  // Web and Wails already receive this through the paired runtime client event subscription.
++  if (!isWebClientLocation()) {
++    const stopLocal = window.api.linear?.onLinkedIssueUpdated?.((event) =>
++      owner.handle({ kind: 'local' }, event)
++    )
++    if (stopLocal) {
++      unsubs.push(stopLocal)
++    }
+   }
+   return owner
+ }

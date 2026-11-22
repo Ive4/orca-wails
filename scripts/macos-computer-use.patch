@@ -1,0 +1,65 @@
+diff --git a/native/computer-use-macos/Sources/OrcaComputerUseMacOS/main.swift b/native/computer-use-macos/Sources/OrcaComputerUseMacOS/main.swift
+--- a/native/computer-use-macos/Sources/OrcaComputerUseMacOS/main.swift
++++ b/native/computer-use-macos/Sources/OrcaComputerUseMacOS/main.swift
+@@ -5219,26 +5219,47 @@
+ }
+ 
+ private func isAuthorizedAgentPeer(_ pid: pid_t) -> Bool {
+-    guard let command = processCommand(pid),
+-          command.contains("/out/main/computer-sidecar.js")
+-              || command.contains("/Contents/Resources/app.asar.unpacked/out/main/computer-sidecar.js")
++    // Match the kernel-reported peer to the sidecar that spawned this helper.
++    guard pid == getppid(), let runtime = processExecutablePath(pid),
++          let command = processCommand(pid)?.trimmingCharacters(in: .newlines),
++          let slotPath = canonicalPath(Bundle.main.bundleURL.deletingLastPathComponent().path)
+     else {
+         return false
+     }
+-    if isTrustedOrcaApplication(pid) {
+-        return true
+-    }
+-    guard let parentPid = parentProcessId(pid) else { return false }
+-    return isTrustedOrcaApplication(parentPid)
+-}
+-
+-private func isTrustedOrcaApplication(_ pid: pid_t) -> Bool {
+-    guard let app = NSRunningApplication(processIdentifier: pid),
+-          let bundleId = app.bundleIdentifier
++
++    let slot = URL(fileURLWithPath: slotPath, isDirectory: true)
++    let runtimeURL = URL(fileURLWithPath: runtime)
++    let runtimes = slot.deletingLastPathComponent().appendingPathComponent("runtimes")
++    let sidecar = slot.appendingPathComponent("computer-sidecar.js")
++    let server = slot.appendingPathComponent("orcad-server.js")
++    guard runtimeURL.lastPathComponent == "bun",
++          runtimeURL.deletingLastPathComponent().deletingLastPathComponent().path == runtimes.path,
++          command == "\(runtime) --no-env-file \(sidecar.path)",
++          let corePID = parentProcessId(pid), processExecutablePath(corePID) == runtime,
++          processCommand(corePID)?.hasPrefix("\(runtime) \(server.path) --bind ") == true,
++          let hostPID = parentProcessId(corePID),
++          let host = NSRunningApplication(processIdentifier: hostPID),
++          let bundleId = host.bundleIdentifier,
++          let hostExecutable = host.executableURL, hostExecutable.lastPathComponent == "orca-wails",
++          let hostPath = canonicalPath(hostExecutable.path), processExecutablePath(hostPID) == hostPath
+     else {
+         return false
+     }
+-    return TrustedOrcaApplication.isTrusted(bundleId: bundleId)
++
++    return bundleId == "dev.orca-wails.desktop" || bundleId.hasPrefix("dev.orca-wails.smoke.")
++}
++
++private func processExecutablePath(_ pid: pid_t) -> String? {
++    var buffer = [UInt8](repeating: 0, count: Int(MAXPATHLEN) * 4)
++    guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
++    return String(decoding: buffer.prefix { $0 != 0 }, as: UTF8.self)
++}
++
++private func canonicalPath(_ path: String) -> String? {
++    // Match the kernel's /private/tmp paths and the paths passed to Bun by Wails.
++    guard let resolved = realpath(path, nil) else { return nil }
++    defer { free(resolved) }
++    return String(validatingCString: resolved)
+ }
+ 
+ private func parentProcessId(_ pid: pid_t) -> pid_t? {

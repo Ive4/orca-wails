@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,12 +18,16 @@ import (
 const structuredTabPrefix = "structured-agent-session-"
 const maxAnswerBytes = 64 * 1024
 const maxAnswerPayloadBytes = 256 * 1024
+const maxQuestionParts = 4
+const maxSelectedOptions = 64
 
 var (
 	ErrNoQuickQuestion = errors.New("请在原会话中查看并回复")
 	ErrQuestionChanged = errors.New("问题已变化，请重新打开后回复")
 	ErrAnswerRefused   = errors.New("Core 未接收这条回复，请打开原会话查看")
-	ErrAnswerUncertain = errors.New("发送结果待确认，请在原会话查看")
+	ErrAnswerUncertain = errors.New("结果待确认，可核对原会话的记录")
+	ErrAnswerTooLarge  = errors.New("回复内容超出长度限制，请缩短后发送")
+	ErrInvalidAnswer   = errors.New("回复与当前问题不匹配，请检查后重试")
 	ErrBotOpen         = errors.New("对话已创建，请从 Orca 的机器人列表打开")
 )
 
@@ -31,25 +36,37 @@ func (t Target) StructuredSessionID() string {
 		return ""
 	}
 	id, ok := strings.CutPrefix(t.TabID, structuredTabPrefix)
+	if t.ChatSessionID != "" && t.LeafID != nil {
+		id, ok = t.ChatSessionID, true
+	}
 	if !ok || id == "" || len(id) > 512 {
 		return ""
 	}
 	if t.LeafID != nil {
 		// Core publishes a synthetic leaf for structured task rows.
-		digest := sha256.Sum256([]byte(id))
-		leaf := hex.EncodeToString(digest[:16])
-		expected := leaf[:8] + "-" + leaf[8:12] + "-4" + leaf[13:16] + "-a" + leaf[17:20] + "-" + leaf[20:]
-		if *t.LeafID != expected {
+		if *t.LeafID != structuredLeafID(id) {
 			return ""
 		}
 	}
 	return id
 }
 
+func structuredLeafID(sessionID string) string {
+	digest := sha256.Sum256([]byte(sessionID))
+	leaf := hex.EncodeToString(digest[:16])
+	return leaf[:8] + "-" + leaf[8:12] + "-4" + leaf[13:16] + "-a" + leaf[17:20] + "-" + leaf[20:]
+}
+
 type rpcCall func(method string, params any, output any) error
 
 func withRuntime[T any](ctx context.Context, data string, pid uint32, run func(rpcCall) (T, error)) (T, error) {
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	return withRuntimeHost(ctx, data, pid, 8*time.Second, func(call rpcCall, _ string) (T, error) {
+		return run(call)
+	})
+}
+
+func withRuntimeHost[T any](ctx context.Context, data string, pid uint32, timeout time.Duration, run func(rpcCall, string) (T, error)) (T, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	metadata, err := runtimeFor(ctx, data, pid)
 	if err != nil {
@@ -74,27 +91,33 @@ func withRuntime[T any](ctx context.Context, data string, pid uint32, run func(r
 			return errors.New("Orca Core did not accept the tray request")
 		}
 		return unmarshalWire(result, output)
-	})
+	}, metadata.runtimeID)
 }
 
 type QuestionOption struct {
 	ID          string `json:"id"`
 	Label       string `json:"label"`
 	Description string `json:"description,omitempty"`
-	Preview     string `json:"-"`
+	Preview     string `json:"preview,omitempty"`
+	Intent      string `json:"intent,omitempty"`
 }
 
-type Question struct {
+type QuestionPart struct {
 	ID          string           `json:"id"`
-	Revision    uint64           `json:"revision"`
 	Text        string           `json:"text"`
+	MultiSelect bool             `json:"multiSelect"`
 	Options     []QuestionOption `json:"options"`
 	AcceptsText bool             `json:"acceptsText"`
 	AllowEmpty  bool             `json:"allowEmpty"`
 	Placeholder string           `json:"placeholder,omitempty"`
 	InitialText string           `json:"initialText,omitempty"`
-	questionID  string
-	fence       uint64
+}
+
+type Question struct {
+	ID       string         `json:"id"`
+	Revision uint64         `json:"revision"`
+	Parts    []QuestionPart `json:"parts"`
+	fence    uint64
 }
 
 type wireQuestion struct {
@@ -112,96 +135,158 @@ type wireQuestion struct {
 
 func (q *QuestionOption) UnmarshalJSON(data []byte) error {
 	return decodeObject(data, required("id", &q.ID), required("label", &q.Label),
-		defaulted("description", &q.Description), defaulted("preview", &q.Preview))
+		defaulted("description", &q.Description), defaulted("preview", &q.Preview), optional("intent", &q.Intent))
 }
 
-func ReadQuestion(ctx context.Context, data string, pid uint32, sessionID string) (*Question, error) {
-	return withRuntime(ctx, data, pid, func(call rpcCall) (*Question, error) {
-		return readQuestion(call, sessionID)
-	})
+func readQuestion(call rpcCall, sessionID, requestedID string) (*Question, error) {
+	prompt, err := readPrompt(call, sessionID, requestedID, false)
+	return prompt.Question, err
 }
 
-func readQuestion(call rpcCall, sessionID string) (*Question, error) {
+type promptHistory struct {
+	SessionID string   `json:"sessionId"`
+	Fence     uint64   `json:"fence"`
+	Prompts   []string `json:"actionablePromptIds"`
+}
+
+func readPromptHistory(call rpcCall, sessionID string) (promptHistory, error) {
 	if sessionID == "" {
-		return nil, ErrNoQuickQuestion
+		return promptHistory{}, ErrNoQuickQuestion
 	}
 	var history struct {
-		OK   bool `json:"ok"`
-		Page struct {
-			SessionID string   `json:"sessionId"`
-			Fence     uint64   `json:"fence"`
-			Prompts   []string `json:"actionablePromptIds"`
-		} `json:"page"`
+		OK   bool          `json:"ok"`
+		Page promptHistory `json:"page"`
 	}
 	if err := call("agentSession.history", map[string]any{
 		"sessionId": sessionID, "direction": "tail", "limit": 1,
 	}, &history); err != nil {
-		return nil, err
+		return promptHistory{}, err
 	}
 	page := history.Page
-	if !history.OK || page.SessionID != sessionID || page.Fence == 0 || len(page.Prompts) != 1 || page.Prompts[0] == "" {
-		return nil, ErrNoQuickQuestion
+	if !history.OK || page.SessionID != sessionID || page.Fence == 0 {
+		return promptHistory{}, ErrNoQuickQuestion
 	}
+	return page, nil
+}
+
+func readPrompt(call rpcCall, sessionID, requestedID string, includeApprovals bool) (Prompt, error) {
+	page, err := readPromptHistory(call, sessionID)
+	if err != nil {
+		return Prompt{}, err
+	}
+	prompt := Prompt{Count: len(page.Prompts)}
+	for _, id := range page.Prompts {
+		if id == "" || (requestedID != "" && id != requestedID) {
+			continue
+		}
+		item, err := readPromptItem(call, sessionID, id)
+		if err != nil && !errors.Is(err, ErrNoQuickQuestion) {
+			return Prompt{}, err
+		}
+		if item == nil || item.Body.Resolution.State != "pending" {
+			continue
+		}
+		switch item.Body.Kind {
+		case "question":
+			prompt.Question, _ = item.question(page.Fence)
+		case "approval":
+			if includeApprovals {
+				prompt.Approval = item.approval(page.Fence)
+			}
+		}
+		if prompt.Question != nil || prompt.Approval != nil {
+			return prompt, nil
+		}
+	}
+	if requestedID != "" {
+		return Prompt{}, ErrQuestionChanged
+	}
+	return prompt, ErrNoQuickQuestion
+}
+
+type promptItem struct {
+	ID        string `json:"itemId"`
+	Revision  uint64 `json:"revision"`
+	Shortened bool   `json:"shortened"`
+	Body      struct {
+		wireQuestion
+		approvalBody
+		Kind       string         `json:"kind"`
+		Questions  []wireQuestion `json:"questions"`
+		Resolution struct {
+			State      string              `json:"state"`
+			OptionID   string              `json:"selectedOptionId"`
+			Answers    []QuestionSelection `json:"answers"`
+			ResolvedAt int64               `json:"resolvedAt"`
+		} `json:"resolution"`
+	} `json:"body"`
+}
+
+func readPromptItem(call rpcCall, sessionID, id string) (*promptItem, error) {
 	var detail struct {
-		Item *struct {
-			ID        string `json:"itemId"`
-			Revision  uint64 `json:"revision"`
-			Shortened bool   `json:"shortened"`
-			Body      struct {
-				wireQuestion
-				Kind       string         `json:"kind"`
-				Questions  []wireQuestion `json:"questions"`
-				Resolution struct {
-					State string `json:"state"`
-				} `json:"resolution"`
-			} `json:"body"`
-		} `json:"item"`
+		Item *promptItem `json:"item"`
 	}
-	if err := call("agentSession.item", map[string]string{"sessionId": sessionID, "itemId": page.Prompts[0]}, &detail); err != nil {
+	if err := call("agentSession.item", map[string]string{"sessionId": sessionID, "itemId": id}, &detail); err != nil {
 		return nil, err
 	}
 	item := detail.Item
-	if item == nil || item.ID != page.Prompts[0] || item.Revision == 0 || item.Shortened ||
-		item.Body.Kind != "question" || item.Body.Resolution.State != "pending" {
+	if item == nil || item.ID != id || item.Revision == 0 || item.Shortened {
 		return nil, ErrNoQuickQuestion
 	}
-	wire := item.Body.wireQuestion
-	if item.Body.Questions != nil {
-		if len(item.Body.Questions) != 1 {
-			return nil, ErrNoQuickQuestion
-		}
-		wire = item.Body.Questions[0]
-	} else {
+	return item, nil
+}
+
+func (item *promptItem) question(fence uint64) (*Question, error) {
+	wires := item.Body.Questions
+	if wires == nil {
+		wire := item.Body.wireQuestion
 		wire.ID = "q1"
 		if wire.FreeTextID != "" {
 			wire.ID = wire.FreeTextID
 		}
+		wires = []wireQuestion{wire}
 	}
-	if wire.ID == "" || wire.MultiSelect || strings.TrimSpace(wire.Text) == "" ||
-		(len(wire.Options) == 0 && wire.FreeTextID == "") {
+	if len(wires) == 0 || len(wires) > maxQuestionParts {
 		return nil, ErrNoQuickQuestion
 	}
-	seen := make(map[string]bool, len(wire.Options))
-	for _, option := range wire.Options {
-		if option.ID == "" || strings.TrimSpace(option.Label) == "" || option.Preview != "" || seen[option.ID] {
+	q := &Question{ID: item.ID, Revision: item.Revision, fence: fence}
+	seen := make(map[string]bool, len(wires))
+	for _, wire := range wires {
+		if wire.ID == "" || seen[wire.ID] || strings.TrimSpace(wire.Text) == "" ||
+			(len(wire.Options) == 0 && wire.FreeTextID == "") {
 			return nil, ErrNoQuickQuestion
 		}
-		seen[option.ID] = true
+		seen[wire.ID] = true
+		options := make(map[string]bool, len(wire.Options))
+		for _, option := range wire.Options {
+			if option.ID == "" || strings.TrimSpace(option.Label) == "" || options[option.ID] {
+				return nil, ErrNoQuickQuestion
+			}
+			options[option.ID] = true
+		}
+		if wire.Options == nil {
+			wire.Options = []QuestionOption{}
+		}
+		q.Parts = append(q.Parts, QuestionPart{
+			ID: wire.ID, Text: wire.Text, MultiSelect: wire.MultiSelect, Options: wire.Options,
+			AcceptsText: wire.FreeTextID != "", AllowEmpty: wire.FreeTextInput.AllowEmpty,
+			Placeholder: wire.FreeTextInput.Placeholder, InitialText: wire.FreeTextInput.InitialText,
+		})
 	}
-	if wire.Options == nil {
-		wire.Options = []QuestionOption{}
-	}
-	return &Question{ID: item.ID, Revision: item.Revision, Text: wire.Text, Options: wire.Options,
-		AcceptsText: wire.FreeTextID != "", AllowEmpty: wire.FreeTextInput.AllowEmpty,
-		Placeholder: wire.FreeTextInput.Placeholder, InitialText: wire.FreeTextInput.InitialText,
-		questionID: wire.ID, fence: page.Fence}, nil
+	return q, nil
+}
+
+type QuestionSelection struct {
+	QuestionID string   `json:"questionId"`
+	OptionIDs  []string `json:"optionIds"`
+	Other      *string  `json:"other,omitempty"`
 }
 
 type Answer struct {
-	QuestionID string  `json:"id"`
-	Revision   uint64  `json:"revision"`
-	OptionID   string  `json:"optionId,omitempty"`
-	Text       *string `json:"text,omitempty"`
+	QuestionID     string              `json:"id"`
+	Revision       uint64              `json:"revision"`
+	Selections     []QuestionSelection `json:"selections"`
+	ApprovalOption string              `json:"approvalOption,omitempty"`
 }
 
 // AnswerQuestion revalidates the live prompt and lets Core atomically compare its revision.
@@ -213,33 +298,44 @@ func AnswerQuestion(ctx context.Context, data string, pid uint32, sessionID stri
 }
 
 func answerQuestion(call rpcCall, sessionID string, answer Answer) error {
-	q, err := readQuestion(call, sessionID)
+	if answer.QuestionID == "" {
+		return ErrQuestionChanged
+	}
+	prompt, err := readPrompt(call, sessionID, answer.QuestionID, answer.ApprovalOption != "")
 	if err != nil {
 		return err
 	}
+	if answer.ApprovalOption != "" {
+		approval := prompt.Approval
+		if approval == nil || approval.Revision != answer.Revision ||
+			!slices.ContainsFunc(approval.Options, func(option QuestionOption) bool { return option.ID == answer.ApprovalOption }) {
+			return ErrInvalidAnswer
+		}
+		return submitPrompt(call, sessionID, "Approval", approval.ID, approval.Revision, approval.fence, map[string]any{
+			"itemId": approval.ID, "expectedRevision": approval.Revision, "optionId": answer.ApprovalOption,
+		})
+	}
+	q := prompt.Question
 	if q.ID != answer.QuestionID || q.Revision != answer.Revision {
 		return ErrQuestionChanged
 	}
-	fields, err := questionAnswer(q, answer.OptionID, answer.Text)
+	fields, err := questionAnswer(q, answer.Selections)
 	if err != nil {
 		return err
 	}
 	encoded, err := coreJSON(fields["answers"])
 	if err != nil || len(encoded) > maxAnswerPayloadBytes {
-		return errors.New("回复内容超出长度限制")
+		return ErrAnswerTooLarge
 	}
-	fingerprint, err := questionFingerprint(sessionID, fields)
+	return submitPrompt(call, sessionID, "Question", q.ID, q.Revision, q.fence, fields)
+}
+
+func submitPrompt(call rpcCall, sessionID, kind, itemID string, revision, fence uint64, fields map[string]any) error {
+	envelope, err := mutationEnvelope("agentSession.respondTo:"+strings.ToLower(kind), sessionID, fence, newOperationID(), fields)
 	if err != nil {
 		return err
 	}
-
-	var entropy [16]byte
-	rand.Read(entropy[:])
-	fields["envelope"] = map[string]any{
-		"sessionId": sessionID, "expectedRuntimeFence": q.fence,
-		"clientOperationId":  fmt.Sprintf("%d-%x", time.Now().UnixMilli(), entropy),
-		"payloadFingerprint": fingerprint,
-	}
+	fields["envelope"] = envelope
 	var receipt struct {
 		OK      *bool `json:"ok"`
 		Refusal struct {
@@ -256,7 +352,7 @@ func answerQuestion(call rpcCall, sessionID string, answer Answer) error {
 			} `json:"resolution"`
 		} `json:"value"`
 	}
-	if err := call("agentSession.respondToQuestion", fields, &receipt); err != nil || receipt.OK == nil {
+	if err := call("agentSession.respondTo"+kind, fields, &receipt); err != nil || receipt.OK == nil {
 		return ErrAnswerUncertain
 	}
 	if !*receipt.OK {
@@ -272,34 +368,84 @@ func answerQuestion(call rpcCall, sessionID string, answer Answer) error {
 			return ErrAnswerRefused
 		}
 	}
-	if receipt.Value.ID != q.ID || receipt.Value.Revision < q.Revision || receipt.Value.Resolution.State != "resolved" {
+	if receipt.Value.ID != itemID || receipt.Value.Revision < revision || receipt.Value.Resolution.State != "resolved" {
 		return ErrAnswerUncertain
 	}
 	return nil
 }
 
-func questionAnswer(q *Question, optionID string, text *string) (map[string]any, error) {
-	selection := map[string]any{"questionId": q.questionID, "optionIds": []string{}}
-	switch {
-	case optionID != "" && text == nil:
-		for _, option := range q.Options {
-			if option.ID == optionID {
-				selection["optionIds"] = []string{optionID}
-				return map[string]any{"itemId": q.ID, "expectedRevision": q.Revision, "answers": []any{selection}}, nil
+func questionAnswer(q *Question, selections []QuestionSelection) (map[string]any, error) {
+	if len(selections) != len(q.Parts) {
+		return nil, ErrInvalidAnswer
+	}
+	answers := make([]map[string]any, 0, len(q.Parts))
+	for _, part := range q.Parts {
+		index := slices.IndexFunc(selections, func(selection QuestionSelection) bool {
+			return selection.QuestionID == part.ID
+		})
+		if index < 0 {
+			return nil, ErrInvalidAnswer
+		}
+		selected := selections[index]
+		optionIDs := selected.OptionIDs
+		if optionIDs == nil {
+			optionIDs = []string{}
+		}
+		if len(optionIDs) > maxSelectedOptions {
+			return nil, ErrInvalidAnswer
+		}
+		for i, id := range optionIDs {
+			if slices.Contains(optionIDs[:i], id) || !slices.ContainsFunc(part.Options, func(option QuestionOption) bool {
+				return option.ID == id
+			}) {
+				return nil, ErrInvalidAnswer
 			}
 		}
-	case optionID == "" && text != nil && q.AcceptsText && utf8.ValidString(*text) && len(*text) <= maxAnswerBytes:
-		if q.AllowEmpty || strings.TrimSpace(*text) != "" {
-			selection["other"] = *text
-			return map[string]any{"itemId": q.ID, "expectedRevision": q.Revision, "answers": []any{selection}}, nil
+		count := len(optionIDs)
+		answer := map[string]any{"questionId": part.ID, "optionIds": optionIDs}
+		if text := selected.Other; text != nil {
+			if len(*text) > maxAnswerBytes {
+				return nil, ErrAnswerTooLarge
+			}
+			if !part.AcceptsText || !utf8.ValidString(*text) ||
+				(!part.AllowEmpty && strings.TrimSpace(*text) == "") {
+				return nil, ErrInvalidAnswer
+			}
+			answer["other"] = *text
+			count++
 		}
+		if count == 0 || (!part.MultiSelect && count != 1) {
+			return nil, ErrInvalidAnswer
+		}
+		answers = append(answers, answer)
 	}
-	return nil, errors.New("回复与当前问题不匹配，请检查后重试")
+	return map[string]any{"itemId": q.ID, "expectedRevision": q.Revision, "answers": answers}, nil
 }
 
 func questionFingerprint(sessionID string, fields map[string]any) (string, error) {
+	return payloadFingerprint("agentSession.respondTo:question", sessionID, fields)
+}
+
+func newOperationID() string {
+	var entropy [16]byte
+	rand.Read(entropy[:])
+	return fmt.Sprintf("%d-%x", time.Now().UnixMilli(), entropy)
+}
+
+func mutationEnvelope(method, sessionID string, fence uint64, operationID string, fields map[string]any) (map[string]any, error) {
+	fingerprint, err := payloadFingerprint(method, sessionID, fields)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"sessionId": sessionID, "expectedRuntimeFence": fence,
+		"clientOperationId": operationID, "payloadFingerprint": fingerprint,
+	}, nil
+}
+
+func payloadFingerprint(method, sessionID string, fields map[string]any) (string, error) {
 	canonical, err := coreJSON(map[string]any{
-		"method": "agentSession.respondTo:question", "sessionId": sessionID, "fields": fields,
+		"method": method, "sessionId": sessionID, "fields": fields,
 	})
 	if err != nil {
 		return "", err

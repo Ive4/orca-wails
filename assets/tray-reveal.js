@@ -1,8 +1,10 @@
-// Route tray selections through the packaged Orca Web renderer's UI.
+// Route tray selections through the packaged Orca renderer's UI.
 // This shim calls no Tauri API and runs only in the local view.
 (() => {
-  if (window.top !== window || location.protocol !== "http:" ||
-      location.hostname !== "127.0.0.1" || location.pathname !== "/web-index.html") return;
+  const desktop = location.pathname === "/desktop/index.html" && window.__orcaWailsDesktop?.protocol === 1;
+  const legacy = location.protocol === "http:" && location.hostname === "127.0.0.1" &&
+    location.pathname === "/web-index.html";
+  if (window.top !== window || (!desktop && !legacy)) return;
 
   let terminalListener, editorListener, pending, timer;
   const requestId = "orca-tray";
@@ -47,7 +49,10 @@
   function reveal() {
     if (!pending) return;
     const {worktreeId, tabId, leafId} = pending.target;
-    const chat = tabId.startsWith("structured-agent-session-");
+    const chatPrefix = "structured-agent-session-";
+    const sessionId = pending.target.sessionId ||
+      (tabId.startsWith(chatPrefix) ? tabId.slice(chatPrefix.length) : "");
+    const chat = sessionId !== "";
     if (!(chat ? editorListener : terminalListener)) return;
     const now = performance.now();
     pending.deadline ??= now + 15000;
@@ -55,7 +60,6 @@
       pending = undefined;
       return;
     }
-    const sessionId = chat ? tabId.slice("structured-agent-session-".length) : "";
     if (chat && pending.target.focusComposer && pending.announced) {
       const scope = CSS.escape("agent-session:" + sessionId);
       const root = `[data-native-chat-composer-scope="${scope}"] [data-composer-field]`;
@@ -72,10 +76,11 @@
       // The paired renderer projects host chat IDs into its own tab IDs.
       // First reveal its workspace, then activate the actual mounted tab.
       const scope = `[data-tab-group-strip-id][data-worktree-id="${CSS.escape(worktreeId)}"]`;
-      const escaped = CSS.escape(tabId);
-      const candidates = document.querySelectorAll(
-        `${scope} [data-tab-id="${escaped}"], ${scope} [data-tab-id^="${escaped}:history-"]`
-      );
+      const selectors = [...new Set([tabId, chatPrefix + sessionId])].flatMap(id => {
+        const escaped = CSS.escape(id);
+        return [`${scope} [data-tab-id="${escaped}"]`, `${scope} [data-tab-id^="${escaped}:history-"]`];
+      });
+      const candidates = document.querySelectorAll(selectors.join(", "));
       if (candidates.length === 1 && !pending.selectedTab) {
         const selected = candidates[0].dataset.tabId;
         editorListener({worktreeId, tabId:selected, userInitiated:true});

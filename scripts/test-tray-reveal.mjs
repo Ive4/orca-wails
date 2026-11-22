@@ -105,6 +105,16 @@ test("reveals a chat through its mounted renderer tab, including history suffixe
   assert.equal(observed.chat[1].tabId, "structured-agent-session-session:history-1");
 });
 
+test("reveals a chat launched with a reserved noncanonical tab ID", () => {
+  const { window, observed, tick } = renderer();
+  window.__orcaTrayReveal({ worktreeId: "workspace", tabId: "reserved-tab", sessionId: "session_reserved" });
+  assert.equal(observed.chat[0]?.tabId, "agent-session:session_reserved");
+  observed.chats = ["structured-agent-session-session_reserved"];
+  tick();
+  assert.equal(observed.chat.at(-1)?.tabId, "structured-agent-session-session_reserved");
+  assert.equal(observed.terminal.length, 0);
+});
+
 test("paired server pages cannot install the local navigation shim", () => {
   const { window } = renderer("http://localhost:9090/web-index.html");
   assert.equal(window.__orcaTrayReveal, undefined);

@@ -1,0 +1,113 @@
+diff --git a/src/renderer/src/components/bots/BotConnectorsHostNotice.tsx b/src/renderer/src/components/bots/BotConnectorsHostNotice.tsx
+index 2c6e229..c165522 100644
+--- a/src/renderer/src/components/bots/BotConnectorsHostNotice.tsx
++++ b/src/renderer/src/components/bots/BotConnectorsHostNotice.tsx
+@@ -210,7 +210,7 @@ export function BotHostSignInControl({
+ }): React.JSX.Element {
+   const signIn = useBotHostSignIn(hostId)
+   const target = botHostTarget(hostId)
+-  const local = target.kind === 'environment' && isWailsLocalRuntime(target.environmentId)
++  const local = isWailsLocalRuntime(target.kind === 'environment' ? target.environmentId : null)
+   if (signIn.phase === 'waiting') {
+     return (
+       <SignInWaiting
+diff --git a/src/renderer/src/components/settings/accounts/orca/ServerOrcaAccountPane.tsx b/src/renderer/src/components/settings/accounts/orca/ServerOrcaAccountPane.tsx
+index ff6aae5..d77bb15 100644
+--- a/src/renderer/src/components/settings/accounts/orca/ServerOrcaAccountPane.tsx
++++ b/src/renderer/src/components/settings/accounts/orca/ServerOrcaAccountPane.tsx
+@@ -5,7 +5,10 @@ import { useHostBots } from '@/lib/bot-catalog'
+ import { BotHostSignInControl } from '../../../bots/BotConnectorsHostNotice'
+ import { useBotHostLabel } from '../../../bots/use-bot-host-label'
+ import { isWailsLocalRuntime } from '@/runtime/hosts/display/wails-local-runtime'
+-import { toRuntimeExecutionHostId } from '../../../../../../shared/execution-host/execution-host'
++import {
++  LOCAL_EXECUTION_HOST_ID,
++  toRuntimeExecutionHostId
++} from '../../../../../../shared/execution-host/execution-host'
+ import type { OrcaAccountServerStatus } from '../../../../../../shared/orca-account-server-sign-in'
+ import { accountStatusCopy, OrcaAccountHeader } from './OrcaAccountSettingsPane'
+ 
+@@ -19,10 +22,11 @@ const PROFILE_STATE = {
+ export function ServerOrcaAccountPane({
+   environmentId
+ }: {
+-  environmentId: string
++  environmentId: string | null
+ }): React.JSX.Element {
+   const t = useTranslate()
+-  const hostId = toRuntimeExecutionHostId(environmentId)
++  const hostId =
++    environmentId === null ? LOCAL_EXECUTION_HOST_ID : toRuntimeExecutionHostId(environmentId)
+   const local = isWailsLocalRuntime(environmentId)
+   const hostLabel =
+     useBotHostLabel(hostId) ??
+diff --git a/src/renderer/src/components/settings/page/settings-setup-workflow-section-renderers.tsx b/src/renderer/src/components/settings/page/settings-setup-workflow-section-renderers.tsx
+index 81503cc..25b2557 100644
+--- a/src/renderer/src/components/settings/page/settings-setup-workflow-section-renderers.tsx
++++ b/src/renderer/src/components/settings/page/settings-setup-workflow-section-renderers.tsx
+@@ -19,6 +19,7 @@ import { SettingsGroup } from '../section-layout/SettingsGroup'
+ import { WorkspaceCleanupSettingsPane } from '../workspace-cleanup/WorkspaceCleanupSettingsPane'
+ import { runtimeTargetEnvironmentId } from '@/runtime/rpc/targets/runtime-client-target'
+ import { isWailsLocalRuntime } from '@/runtime/hosts/display/wails-local-runtime'
++import { getWailsDesktopBridge } from '@/wails/local-runtime'
+ 
+ export function renderOrcaAccountSettingsSection(
+   context: SettingsRenderContext,
+@@ -26,20 +27,23 @@ export function renderOrcaAccountSettingsSection(
+ ): React.JSX.Element | null {
+   const { model, navigation, view } = context
+   const { target } = model.settingsHostScope
++  // The Wails desktop uses the local RPC target and deliberately has no paired catalog entry.
++  const nativeLocalCore = Boolean(getWailsDesktopBridge())
+   const localEnvironmentId = model.runtimeEnvironments.find((env) =>
+     isWailsLocalRuntime(env.id)
+   )?.id
++  const usesLocalCore = nativeLocalCore || Boolean(localEnvironmentId)
+   const serverName =
+     target.kind === 'environment'
+       ? (model.runtimeEnvironments.find((entry) => entry.id === target.environmentId)?.name ??
+         t('components.settings.notifications.server.fallbackHost', 'this server'))
+       : null
+-  return model.showDesktopOnlySettings || localEnvironmentId ? (
++  return model.showDesktopOnlySettings || usesLocalCore ? (
+     <SettingsSection
+       id="orca-account"
+       title={t('auto.components.settings.orcaAccount.title', 'Orca Account')}
+       description={
+-        localEnvironmentId
++        usesLocalCore
+           ? t(
+               'components.settings.orcaAccount.localCore',
+               'The Orca account used on this computer.'
+@@ -57,13 +61,15 @@ export function renderOrcaAccountSettingsSection(
+       }
+       searchEntries={navigation.getSectionSearchEntries('orca-account')}
+     >
+-      {!view.isSectionMounted('orca-account') ? null : !localEnvironmentId &&
++      {!view.isSectionMounted('orca-account') ? null : !usesLocalCore &&
+         !model.settingsHostScope.available ? (
+         <SettingsHostScopeUnavailableNotice />
+       ) : (
+         <SettingsGroup bodyClassName="py-4">
+-          {localEnvironmentId ? (
+-            <ServerOrcaAccountPane environmentId={localEnvironmentId} />
++          {usesLocalCore ? (
++            <ServerOrcaAccountPane
++              environmentId={nativeLocalCore ? null : (localEnvironmentId ?? null)}
++            />
+           ) : target.kind === 'environment' ? (
+             <ServerOrcaAccountPane environmentId={target.environmentId} />
+           ) : (
+diff --git a/src/renderer/src/lib/bot-host-orca-account.ts b/src/renderer/src/lib/bot-host-orca-account.ts
+index b03ad78..394e5bc 100644
+--- a/src/renderer/src/lib/bot-host-orca-account.ts
++++ b/src/renderer/src/lib/bot-host-orca-account.ts
+@@ -203,7 +203,7 @@ async function follow(
+ ): Promise<boolean> {
+   const entry = entryOf(hostId)
+   const target = botHostTarget(hostId)
+-  const local = target.kind === 'environment' && isWailsLocalRuntime(target.environmentId)
++  const local = isWailsLocalRuntime(target.kind === 'environment' ? target.environmentId : null)
+   let flow = from
+   let opened = false
+   while (entry.flowId === flow.flowId) {

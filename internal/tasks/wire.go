@@ -108,16 +108,29 @@ func (w *worktree) UnmarshalJSON(raw []byte) error {
 }
 
 type agent struct {
-	paneKey             string
-	state               string
-	taskTitle           *string
-	conversationName    *string
-	displayName         *string
-	agentType           *string
-	stateStartedAt      *uint64
-	updatedAt           *uint64
-	workingMode         *string
-	restoredUnconfirmed bool
+	paneKey                  string
+	state                    string
+	taskTitle                *string
+	conversationName         *string
+	displayName              *string
+	agentType                *string
+	stateStartedAt           *uint64
+	updatedAt                *uint64
+	completedAt              *uint64
+	completedDurationSeconds *uint64
+	workingMode              *string
+	restoredUnconfirmed      bool
+	interrupted              bool
+	conversationID           string
+	address                  string
+	toolName                 *string
+	outputMetrics            json.RawMessage
+	structuredHostOwned      bool
+	lastAssistantMessage     *string
+	mainAgent                *struct {
+		State   string `json:"state"`
+		Outcome string `json:"outcome"`
+	}
 }
 
 func (a *agent) UnmarshalJSON(raw []byte) error {
@@ -130,9 +143,47 @@ func (a *agent) UnmarshalJSON(raw []byte) error {
 		optional("agentType", &a.agentType),
 		optional("stateStartedAt", &a.stateStartedAt),
 		optional("updatedAt", &a.updatedAt),
+		optional("completedAt", &a.completedAt),
+		optional("completedDurationSeconds", &a.completedDurationSeconds),
 		optional("workingMode", &a.workingMode),
 		defaulted("restoredUnconfirmed", &a.restoredUnconfirmed),
+		optional("interrupted", &a.interrupted),
+		optional("orcaSessionId", &a.conversationID),
+		optional("address", &a.address),
+		optional("toolName", &a.toolName),
+		optional("outputMetrics", &a.outputMetrics),
+		optional("structuredHostOwned", &a.structuredHostOwned),
+		optional("lastAssistantMessage", &a.lastAssistantMessage),
+		optional("mainAgent", &a.mainAgent),
 	)
+}
+
+func parseOutputMetrics(raw json.RawMessage, now uint64) *OutputMetrics {
+	// Decode these fields independently so malformed telemetry cannot drop a task.
+	var fields map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	positiveInteger := func(name string) uint64 {
+		var value uint64
+		if json.Unmarshal(fields[name], &value) != nil {
+			return 0
+		}
+		return value
+	}
+	metrics := OutputMetrics{
+		TurnOutputTokens: positiveInteger("turnOutputTokens"),
+		ToolActive:       bytes.Equal(fields["toolActive"], []byte("true")),
+	}
+	if rate, until := positiveInteger("visibleTokensPerSecond"), positiveInteger("visibleUntil"); rate > 0 && until > now {
+		metrics.VisibleTokensPerSecond = rate
+		metrics.VisibleUntil = until
+		metrics.RequestRate = bytes.Equal(fields["requestRate"], []byte("true"))
+	}
+	if metrics == (OutputMetrics{}) {
+		return nil
+	}
+	return &metrics
 }
 
 type wireField struct {

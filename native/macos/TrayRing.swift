@@ -85,7 +85,7 @@ struct TrayRing {
         let ribbon = 2 * Double.pi * (elapsed.truncatingRemainder(dividingBy: Self.rotationDuration) / Self.rotationDuration)
         let light = 2 * Double.pi * (elapsed.truncatingRemainder(dividingBy: Self.lightDuration) / Self.lightDuration)
         let count = [levels.running, levels.waiting, levels.blocked].filter { $0 > 0 }.count
-        let breath = count == 1 ? 0.87 + 0.13 * cos(elapsed * 2 * .pi / 3.6) : 1
+        let breath = count == 1 ? 0.94 + 0.06 * cos(elapsed * 2 * .pi / 3.6) : 1
         return Frame(levels: levels, rotation: count > 1 ? -ribbon + 0.12 * sin(2 * ribbon) : 0,
                      lightAngle: light - .pi / 2, breath: breath, replyGlow: glow)
     }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -45,15 +46,21 @@ func (d *desktop) refreshNativeTray(readVersions bool) {
 	snapshot["bundledCore"] = d.seed != ""
 	snapshot["coreInstalled"] = versions.installed
 	snapshot["rollbackAvailable"] = versions.rollbackAvailable
+	if d.wechat != nil {
+		snapshot["wechat"] = d.wechat.Snapshot()
+	}
 	official, _ := snapshot["officialVersion"].(string)
 	snapshot["officialVersion"] = upstreamLabel(versions.upstream, official)
 	d.sendNativeSnapshot(snapshot)
 }
 
-func (d *desktop) publishTaskNotices(change trayTaskChanges) {
+func (d *desktop) publishTaskChanges(change trayTaskChanges) {
 	d.clearNativeNotices(change.cleared)
-	if !d.notificationsEnabled() {
+	if !d.notificationsEnabled() || d.quitting.Load() {
 		return
+	}
+	if cues := change.sounds(); len(cues) > 0 {
+		d.sendNativeTaskSounds(cues)
 	}
 	for _, row := range change.attention {
 		state := "任务等待输入"
@@ -73,11 +80,19 @@ func (d *desktop) nativeTrayAction(action, arg string) {
 		return
 	}
 	switch action {
-	case "list_bots", "open_bot_chat", "read_question", "answer_question":
+	case "wechat_start", "wechat_pin", "wechat_test", "wechat_cancel", "wechat_disconnect":
+		d.wechatTrayAction(action, arg)
+		return
+	case "list_bots", "open_bot_chat", "read_prompt", "answer_question", "check_answer",
+		"read_task", "read_changes", "read_diff", "send_follow_up", "check_follow_up", "launch_catalog",
+		"launch_task", "check_launch", "open_launched_surface":
 		d.nativeTrayInteraction(action, arg)
 		return
 	case "refresh":
 		d.refreshNativeTray(true)
+		return
+	case "open_shell_settings":
+		d.request(action, nil)
 		return
 	case "notification_open":
 		d.dispatchRequest(desktopRequest{action: "open_notification", notificationID: arg})
@@ -94,7 +109,13 @@ func (d *desktop) nativeTrayAction(action, arg string) {
 		application.InvokeAsync(func() { d.applyWindowMenuAction(action) })
 		return
 	case "open_task":
-		action = "open"
+		if target := d.notificationTaskTarget(arg); target != nil {
+			d.request("open", target)
+		} else {
+			d.setMessage("任务状态已变化，请刷新后重试")
+			d.refreshNativeTray(false)
+		}
+		return
 	case "notifications":
 		if arg == "on" || arg == "off" {
 			d.request("notifications_"+arg, nil)
@@ -103,6 +124,23 @@ func (d *desktop) nativeTrayAction(action, arg string) {
 	case "menu_bar_on", "menu_bar_off", "notch_on", "notch_off":
 		if err := d.setMacOSEntry(action); err != nil {
 			d.setMessage(err.Error())
+		}
+		d.refreshNativeTray(false)
+		return
+	case "computer_use":
+		var settings computerUseSettings
+		if err := json.Unmarshal([]byte(arg), &settings); err != nil {
+			d.setMessage("无效的电脑操控设置")
+		} else if err := d.setComputerUse(settings); err != nil {
+			d.setMessage(err.Error())
+		}
+		d.refreshNativeTray(false)
+		return
+	case "global_shortcut":
+		if err := d.setTrayShortcut(arg); err != nil {
+			d.setMessage("快捷键设置：" + err.Error())
+		} else {
+			d.setMessage("快捷键已保存")
 		}
 		d.refreshNativeTray(false)
 		return

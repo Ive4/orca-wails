@@ -1,0 +1,657 @@
+diff --git a/src/main/computer/computer-sidecar.ts b/src/main/computer/computer-sidecar.ts
+--- a/src/main/computer/computer-sidecar.ts
++++ b/src/main/computer/computer-sidecar.ts
+@@ -1,8 +1,10 @@
+ import { computerProviderUnavailableMessage } from './computer-provider-unavailable-message'
+ import { currentComputerProvider, shutdownComputerProviders } from './computer-provider-lifecycle'
+ import { RuntimeClientError } from './runtime-client-error'
++import { CuaComputerProvider, createCuaTransport, readComputerUseTarget } from './cua-driver-adapter.mjs'
++import { validateComputerProviderActionParams } from './action-contracts/computer-provider-action-validation'
+ import { ComputerTreeBaselines } from './computer-snapshot-tree-diff'
+-import type { ComputerProviderCapabilities } from '../../shared/computer/computer-use-runtime-types'
++import type { ComputerProviderCapabilities, ComputerSnapshotResult } from '../../shared/computer/computer-use-runtime-types'
+ import { computerTypeTextTargetUnsupportedMessage } from '../../shared/computer/computer-use-type-text-target'
+ 
+ type SidecarRequest = {
+@@ -24,6 +26,8 @@
+ process.once('beforeExit', shutdownProviders)
+ 
+ const treeBaselines = new ComputerTreeBaselines()
++const cuaProviders = new Map<string, CuaComputerProvider>()
++let guestAlias: string | undefined
+ 
+ process.on('message', (message: unknown) => {
+   void handleMessage(message)
+@@ -44,6 +48,23 @@
+ }
+ 
+ async function dispatch(method: string, params: Record<string, unknown>): Promise<unknown> {
++  const target = readComputerUseTarget(process.env, params.backend)
++  if (target.backend !== 'orca') {
++    if (target.backend === 'cua-vm' && target.ssh !== guestAlias) {
++      cuaProviders.get('cua-vm')?.close()
++      cuaProviders.delete('cua-vm')
++      guestAlias = target.ssh
++    }
++    let cua = cuaProviders.get(target.backend)
++    if (!cua) {
++      cua = new CuaComputerProvider(createCuaTransport(target), {
++        backend: target.backend,
++        validateAction: validateComputerProviderActionParams
++      })
++      cuaProviders.set(target.backend, cua)
++    }
++    return cua.dispatch(method, params)
++  }
+   const provider = currentComputerProvider()
+   if (!provider) {
+     throw new RuntimeClientError(
+@@ -54,7 +75,7 @@
+ 
+   switch (method) {
+     case 'capabilities': {
+-      return withTreeDiffCapability(await provider.capabilities())
++      return { ...withTreeDiffCapability(await provider.capabilities()), backend: 'orca' }
+     }
+     case 'listApps': {
+       return await provider.listApps()
+@@ -66,19 +87,19 @@
+       return await provider.listWindows(params)
+     }
+     case 'getAppState': {
+-      return treeBaselines.apply(params, await provider.snapshot(params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.snapshot(params)))
+     }
+     case 'click': {
+-      return treeBaselines.apply(params, await provider.action('click', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('click', params)))
+     }
+     case 'performSecondaryAction': {
+-      return treeBaselines.apply(params, await provider.action('performSecondaryAction', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('performSecondaryAction', params)))
+     }
+     case 'scroll': {
+-      return treeBaselines.apply(params, await provider.action('scroll', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('scroll', params)))
+     }
+     case 'drag': {
+-      return treeBaselines.apply(params, await provider.action('drag', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('drag', params)))
+     }
+     case 'typeText': {
+       if (params.elementIndex !== undefined) {
+@@ -87,19 +108,19 @@
+           throw new RuntimeClientError('unsupported_capability', unsupported)
+         }
+       }
+-      return treeBaselines.apply(params, await provider.action('typeText', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('typeText', params)))
+     }
+     case 'pressKey': {
+-      return treeBaselines.apply(params, await provider.action('pressKey', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('pressKey', params)))
+     }
+     case 'hotkey': {
+-      return treeBaselines.apply(params, await provider.action('hotkey', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('hotkey', params)))
+     }
+     case 'pasteText': {
+-      return treeBaselines.apply(params, await provider.action('pasteText', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('pasteText', params)))
+     }
+     case 'setValue': {
+-      return treeBaselines.apply(params, await provider.action('setValue', params))
++      return withOrcaBackend(treeBaselines.apply(params, await provider.action('setValue', params)))
+     }
+     default:
+       throw new RuntimeClientError(
+@@ -107,6 +128,10 @@
+         `unknown computer sidecar method '${method}'`
+       )
+   }
++}
++
++function withOrcaBackend<T extends ComputerSnapshotResult>(result: T): T {
++  return { ...result, snapshot: { ...result.snapshot, backend: 'orca' } }
+ }
+ 
+ function withTreeDiffCapability(
+@@ -146,5 +171,7 @@
+ }
+ 
+ function shutdownProviders(): void {
++  for (const provider of cuaProviders.values()) provider.close()
++  cuaProviders.clear()
+   shutdownComputerProviders()
+ }
+diff --git a/src/main/computer/sidecar-transport/sidecar-client.ts b/src/main/computer/sidecar-transport/sidecar-client.ts
+--- a/src/main/computer/sidecar-transport/sidecar-client.ts
++++ b/src/main/computer/sidecar-transport/sidecar-client.ts
+@@ -22,6 +22,8 @@
+ 
+ type ComputerSidecarMethod =
+   | 'capabilities'
++  | 'permissions'
++  | 'permissionsStatus'
+   | 'listApps'
+   | 'launchApp'
+   | 'listWindows'
+@@ -58,12 +60,18 @@
+ // Suppress stale child errors without retaining the owner or crashing the process.
+ function ignoreStaleChildError(): void {}
+ 
+-export async function callComputerSidecarListApps(): Promise<ComputerListAppsResult> {
+-  return (await getComputerSidecar().call('listApps', {})) as ComputerListAppsResult
+-}
+-
+-export async function callComputerSidecarCapabilities(): Promise<ComputerProviderCapabilities> {
+-  return (await getComputerSidecar().call('capabilities', {})) as ComputerProviderCapabilities
++export async function callComputerSidecarListApps(backend?: string): Promise<ComputerListAppsResult> {
++  return (await getComputerSidecar().call('listApps', { backend })) as ComputerListAppsResult
++}
++
++export async function callComputerSidecarPermissions(
++  method: 'permissions' | 'permissionsStatus', params: unknown
++): Promise<unknown> {
++  return getComputerSidecar().call(method, params)
++}
++
++export async function callComputerSidecarCapabilities(backend?: string): Promise<ComputerProviderCapabilities> {
++  return (await getComputerSidecar().call('capabilities', { backend })) as ComputerProviderCapabilities
+ }
+ 
+ export async function callComputerSidecarLaunchApp(
+@@ -88,7 +96,7 @@
+ export async function callComputerSidecarAction(
+   method: Exclude<
+     ComputerSidecarMethod,
+-    'capabilities' | 'listApps' | 'launchApp' | 'listWindows' | 'getAppState'
++    'capabilities' | 'permissions' | 'permissionsStatus' | 'listApps' | 'launchApp' | 'listWindows' | 'getAppState'
+   >,
+   params: unknown
+ ): Promise<ComputerActionResult> {
+diff --git a/src/main/runtime/rpc/methods/computer/computer.ts b/src/main/runtime/rpc/methods/computer/computer.ts
+--- a/src/main/runtime/rpc/methods/computer/computer.ts
++++ b/src/main/runtime/rpc/methods/computer/computer.ts
+@@ -4,10 +4,15 @@
+   callComputerSidecarLaunchApp,
+   callComputerSidecarListApps,
+   callComputerSidecarListWindows,
++  callComputerSidecarPermissions,
+   callComputerSidecarSnapshot,
+   resetComputerSidecarForTest
+ } from '../../../../computer/sidecar-transport/sidecar-client'
+ import { defineMethod } from '../../core'
++import type { RpcMethodPermission } from '../../callers/rpc-method-permission'
++import { z, type ZodType } from 'zod'
++import { readComputerUseTarget } from '../../../../computer/cua-driver-adapter.mjs'
++import { RuntimeClientError } from '../../../../computer/runtime-client-error'
+ import {
+   Click,
+   ComputerObserveTarget,
+@@ -33,137 +38,173 @@
+   resetComputerSidecarForTest()
+ }
+ 
++const ComputerBackend = z.enum(['cua', 'cua-vm', 'orca'])
++type ComputerBackend = z.infer<typeof ComputerBackend>
++
++function defineComputerMethod<TParams extends ZodType, TResult>(spec: {
++  name: string
++  permission: RpcMethodPermission
++  params: TParams
++  handler: (params: z.output<TParams>, backend?: ComputerBackend) => TResult
++}) {
++  return [
++    defineMethod({ ...spec, handler: (params) => spec.handler(params) }),
++    // A distinct RPC name makes explicit overrides fail on older Cores before any action.
++    defineMethod({
++      name: spec.name.replace('computer.', 'computer.withBackend.'),
++      permission: spec.permission,
++      params: z.strictObject({ backend: ComputerBackend, params: spec.params }),
++      handler: ({ params, backend }) => spec.handler(params, backend)
++    })
++  ]
++}
++
++function explicitTarget(backend?: ComputerBackend) {
++  try {
++    return readComputerUseTarget(process.env, backend)
++  } catch (error) {
++    if (error instanceof Error && 'code' in error && typeof error.code === 'string') {
++      throw new RuntimeClientError(error.code, error.message)
++    }
++    throw error
++  }
++}
++
+ export const COMPUTER_METHODS = [
+-  defineMethod({
++  ...defineComputerMethod({
+     name: 'computer.capabilities',
+     permission: 'workspace',
+     params: ComputerCapabilitiesParams,
+-    handler: async () => {
+-      return await callComputerSidecarCapabilities()
+-    }
+-  }),
+-  defineMethod({
++    handler: async (_params, backend) => {
++      return await callComputerSidecarCapabilities(backend)
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.listApps',
+     permission: 'desktop-control',
+     params: ListApps,
+-    handler: async () => {
+-      return await callComputerSidecarListApps()
+-    }
+-  }),
+-  defineMethod({
++    handler: async (_params, backend) => {
++      return await callComputerSidecarListApps(backend)
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.permissions',
+     permission: 'desktop-control',
+     params: ComputerPermissions,
+-    handler: async (params) => {
++    handler: async (params, backend) => {
++      const target = explicitTarget(backend)
++      if (target.backend !== 'orca') return callComputerSidecarPermissions('permissions', { ...params, backend: target.backend })
+       const { openComputerUsePermissions } =
+         await import('../../../../computer/macos-permissions/macos-computer-use-permissions')
+       return openComputerUsePermissions(params.id, { skipGranted: params.skipGranted === true })
+     }
+   }),
+-  defineMethod({
++  ...defineComputerMethod({
+     name: 'computer.permissionsStatus',
+     permission: 'workspace',
+     params: ComputerPermissionsStatusParams,
+-    handler: async () => {
++    handler: async (_params, backend) => {
++      const target = explicitTarget(backend)
++      if (target.backend !== 'orca') return callComputerSidecarPermissions('permissionsStatus', { backend: target.backend })
+       const { computerUsePermissionStatusGate } =
+         await import('../../../../computer/macos-permissions/macos-computer-use-permission-status-gate')
+       return computerUsePermissionStatusGate.read()
+     }
+   }),
+-  defineMethod({
++  ...defineComputerMethod({
+     name: 'computer.launchApp',
+     permission: 'desktop-control',
+     params: LaunchApp,
+-    handler: async (params) => {
+-      return await callComputerSidecarLaunchApp(params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarLaunchApp({ ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.listWindows',
+     permission: 'desktop-control',
+     params: ListWindows,
+-    handler: async (params) => {
+-      return await callComputerSidecarListWindows(params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarListWindows({ ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.getAppState',
+     permission: 'desktop-control',
+     params: ComputerObserveTarget,
+-    handler: async (params) => {
+-      return await callComputerSidecarSnapshot(params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarSnapshot({ ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.click',
+     permission: 'desktop-control',
+     params: Click,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('click', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('click', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.performSecondaryAction',
+     permission: 'desktop-control',
+     params: PerformSecondaryAction,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('performSecondaryAction', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('performSecondaryAction', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.scroll',
+     permission: 'desktop-control',
+     params: Scroll,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('scroll', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('scroll', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.drag',
+     permission: 'desktop-control',
+     params: Drag,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('drag', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('drag', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.typeText',
+     permission: 'desktop-control',
+     params: TypeText,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('typeText', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('typeText', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.pressKey',
+     permission: 'desktop-control',
+     params: PressKey,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('pressKey', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('pressKey', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.hotkey',
+     permission: 'desktop-control',
+     params: Hotkey,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('hotkey', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('hotkey', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.pasteText',
+     permission: 'desktop-control',
+     params: PasteText,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('pasteText', params)
+-    }
+-  }),
+-  defineMethod({
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('pasteText', { ...params, backend })
++    }
++  }),
++  ...defineComputerMethod({
+     name: 'computer.setValue',
+     permission: 'desktop-control',
+     params: SetValue,
+-    handler: async (params) => {
+-      return await callComputerSidecarAction('setValue', params)
++    handler: async (params, backend) => {
++      return await callComputerSidecarAction('setValue', { ...params, backend })
+     }
+   })
+ ]
+diff --git a/src/main/runtime/rpc/dispatch/runtime-feature-interaction.ts b/src/main/runtime/rpc/dispatch/runtime-feature-interaction.ts
+--- a/src/main/runtime/rpc/dispatch/runtime-feature-interaction.ts
++++ b/src/main/runtime/rpc/dispatch/runtime-feature-interaction.ts
+@@ -26,6 +26,7 @@
+   if (method.startsWith('emulator.')) {
+     return null
+   }
++  method = method.replace(/^computer\.withBackend\./, 'computer.')
+   if (method === 'computer.permissions') {
+     return 'computer-use-setup'
+   }
+diff --git a/src/cli/computer/computer.ts b/src/cli/computer/computer.ts
+--- a/src/cli/computer/computer.ts
++++ b/src/cli/computer/computer.ts
+@@ -40,7 +40,7 @@
+ } from './computer-action-flags'
+ import { computerTypeTextTargetUnsupportedMessage } from '../../shared/computer/computer-use-type-text-target'
+ 
+-export const COMPUTER_HANDLERS: Record<string, CommandHandler> = {
++const computerHandlers: Record<string, CommandHandler> = {
+   'computer capabilities': async ({ client, json }) => {
+     const result = await client.call<ComputerProviderCapabilities>('computer.capabilities', {})
+     printResult(result, json, formatComputerCapabilities)
+@@ -62,18 +62,18 @@
+       nextStep?: string | null
+     }>('computer.permissions', id ? { id, skipGranted: true } : {})
+     printResult(result, json, (value) => {
+-      if (value.platform !== 'darwin') {
++      if (value.platform !== 'darwin' && !value.nextStep) {
+         return 'Computer-use permission setup is only required on macOS.'
+       }
+       const firstLine = permissionSetupHeadline(value)
+       return [
+         firstLine,
+-        `Helper app: ${value.helperAppPath}`,
++        value.helperAppPath ? `Helper app: ${value.helperAppPath}` : null,
+         `Permissions: ${value.permissions?.map((permission) => `${permission.id}=${permission.status}`).join(', ') ?? 'unknown'}`,
+         value.nextStep
+           ? `Next: ${value.nextStep}`
+           : 'Computer Use permissions are already granted.',
+-        value.launchedHelper
++        value.launchedHelper && value.helperAppPath?.includes('Orca Computer Use.app')
+           ? 'Use the Allow buttons or drag "Orca Computer Use" into the macOS permission list.'
+           : null
+       ]
+@@ -261,6 +261,35 @@
+   }
+ }
+ 
++function withComputerBackend(handler: CommandHandler): CommandHandler {
++  return async (ctx) => {
++    const backend = ctx.flags.has('backend')
++      ? getOptionalStringFlag(ctx.flags, 'backend')
++      : process.env.ORCA_COMPUTER_USE_BACKEND
++    if (backend === undefined && !ctx.flags.has('backend')) return handler(ctx)
++    if (backend !== 'cua' && backend !== 'cua-vm' && backend !== 'orca') {
++      throw new RuntimeClientError('invalid_argument', 'Computer Use backend must be cua, cua-vm, or orca')
++    }
++    const client = new Proxy(ctx.client, {
++      get(target, property) {
++        if (property === 'call') {
++          const call: typeof target.call = (method, params, options) => method.startsWith('computer.')
++            ? target.call(method.replace('computer.', 'computer.withBackend.'), { backend, params: params ?? {} }, options)
++            : target.call(method, params, options)
++          return call
++        }
++        const value = Reflect.get(target, property, target)
++        return typeof value === 'function' ? value.bind(target) : value
++      }
++    })
++    return handler({ ...ctx, client })
++  }
++}
++
++export const COMPUTER_HANDLERS = Object.fromEntries(
++  Object.entries(computerHandlers).map(([name, handler]) => [name, withComputerBackend(handler)])
++)
++
+ function assertComputerAppFlag(flags: Map<string, string | boolean>): void {
+   getRequiredStringFlag(flags, 'app')
+ }
+@@ -277,7 +306,7 @@
+ 
+ function formatComputerCapabilities(value: ComputerProviderCapabilities): string {
+   return [
+-    `${value.provider} (${value.platform}, protocol ${value.protocolVersion})`,
++    `${value.provider} (${[value.backend, value.platform, 'protocol ' + value.protocolVersion].filter(Boolean).join(', ')})`,
+     `  Apps: list=${value.supports.apps.list} bundleIds=${value.supports.apps.bundleIds} pids=${value.supports.apps.pids} launch=${value.supports.apps.launch === true}`,
+     `  Windows: list=${value.supports.windows.list} targetById=${value.supports.windows.targetById} targetByIndex=${value.supports.windows.targetByIndex}`,
+     `  Observation: screenshot=${value.supports.observation.screenshot} elementFrames=${value.supports.observation.elementFrames} annotatedScreenshot=${value.supports.observation.annotatedScreenshot}`,
+diff --git a/src/cli/specs/computer.ts b/src/cli/specs/computer.ts
+--- a/src/cli/specs/computer.ts
++++ b/src/cli/specs/computer.ts
+@@ -5,7 +5,8 @@
+   COMPUTER_WAIT_MAX_TIMEOUT_MS
+ } from '../../shared/computer/computer-wait-timeout'
+ 
+-const COMPUTER_FLAGS = [...GLOBAL_FLAGS, 'worktree', 'session', 'app']
++const COMPUTER_GLOBAL_FLAGS = [...GLOBAL_FLAGS, 'backend']
++const COMPUTER_FLAGS = [...COMPUTER_GLOBAL_FLAGS, 'worktree', 'session', 'app']
+ const COMPUTER_WINDOW_TARGET_FLAGS = ['window-id', 'window-index']
+ const COMPUTER_OBSERVE_FLAGS = [
+   ...COMPUTER_FLAGS,
+@@ -23,25 +24,25 @@
+     path: ['computer', 'capabilities'],
+     summary: 'Show computer-use provider capabilities',
+     usage: 'orca computer capabilities [--json]',
+-    allowedFlags: [...GLOBAL_FLAGS]
++    allowedFlags: [...COMPUTER_GLOBAL_FLAGS]
+   },
+   {
+     path: ['computer', 'list-apps'],
+     summary: 'List running apps available to computer-use',
+     usage: 'orca computer list-apps [--json]',
+-    allowedFlags: [...GLOBAL_FLAGS]
++    allowedFlags: [...COMPUTER_GLOBAL_FLAGS]
+   },
+   {
+     path: ['computer', 'permissions'],
+     summary: 'Open computer-use permission setup',
+     usage: 'orca computer permissions [--id <accessibility|screenshots>] [--json]',
+-    allowedFlags: [...GLOBAL_FLAGS, 'id']
++    allowedFlags: [...COMPUTER_GLOBAL_FLAGS, 'id']
+   },
+   {
+     path: ['computer', 'launch-app'],
+     summary: 'Start a closed app without taking the foreground',
+     usage: 'orca computer launch-app <name|bundle|path> [--activate] [--json]',
+-    allowedFlags: [...GLOBAL_FLAGS, 'app', 'activate'],
++    allowedFlags: [...COMPUTER_GLOBAL_FLAGS, 'app', 'activate'],
+     positionalArgs: ['app'],
+     notes: [
+       'Leaves an app that is already running as it is. Use this instead of `open -a` or Start-Process, which bring the app to the front.',
+@@ -53,7 +54,7 @@
+     path: ['computer', 'list-windows'],
+     summary: 'List windows for an app available to computer-use',
+     usage: 'orca computer list-windows --app <name|bundle|pid:N> [--json]',
+-    allowedFlags: [...GLOBAL_FLAGS, 'app']
++    allowedFlags: [...COMPUTER_GLOBAL_FLAGS, 'app']
+   },
+   {
+     path: ['computer', 'get-app-state'],
+diff --git a/src/cli/discovery/flag-help-text.ts b/src/cli/discovery/flag-help-text.ts
+--- a/src/cli/discovery/flag-help-text.ts
++++ b/src/cli/discovery/flag-help-text.ts
+@@ -83,6 +83,7 @@
+   repo: '--repo <selector>      Repo selector such as id:<id>, name:<name>, or path:<path>',
+   'restore-window':
+     "--restore-window     Bring the target window forward and use foreground input; takes over the user's screen, so ask the user first",
++  backend: '--backend <cua|cua-vm|orca>  Select the Computer Use backend for this command',
+   session: '--session <id>        Snapshot namespace for a related computer-use workflow',
+   setup: '--setup run|skip|inherit Setup policy for repo-defined setup hooks',
+   surface:
+diff --git a/src/cli/discovery/root-help-text-primary.ts b/src/cli/discovery/root-help-text-primary.ts
+--- a/src/cli/discovery/root-help-text-primary.ts
++++ b/src/cli/discovery/root-help-text-primary.ts
+@@ -207,6 +207,7 @@
+   '  orchestration reset       Reset orchestration state',
+   '',
+   'Computer Use:',
++  '  --backend <cua|cua-vm|orca> selects a backend for one command on Orca Wails.',
+   '  computer capabilities     Show computer-use provider capabilities',
+   '  computer permissions      Show or open computer-use permission setup',
+   '  computer list-apps        List running apps available to computer-use',
+diff --git a/src/cli/skills/bundled-skill-guides.ts b/src/cli/skills/bundled-skill-guides.ts
+--- a/src/cli/skills/bundled-skill-guides.ts
++++ b/src/cli/skills/bundled-skill-guides.ts
+@@ -1559,6 +1559,8 @@
+   "---",
+   "",
+   "# Orca Computer Use",
++  "",
++  "On Orca Wails, the desktop setting is a default. Use `--backend cua-vm` on every Computer Use command when testing in the configured Lume guest. Select `cua` for the host or `orca` for the original provider. You can also set `ORCA_COMPUTER_USE_BACKEND` for the commands in one task shell. Check `ORCA computer capabilities --backend cua-vm --json` before acting and use fresh window and element references on the chosen desktop.",
+   "",
+   "Use this skill to drive an app window through `orca computer`, in the background where the platform allows, so the user can keep working. Prefer a programmatic path (shell, filesystem, git, HTTP, existing CLIs) whenever it can complete the task; use this skill only when an app window needs GUI control those cannot reach. Do not use it for Orca's embedded browser (`orca-cli`).",
+   "",
+diff --git a/src/shared/computer/computer-use-runtime-types.ts b/src/shared/computer/computer-use-runtime-types.ts
+--- a/src/shared/computer/computer-use-runtime-types.ts
++++ b/src/shared/computer/computer-use-runtime-types.ts
+@@ -56,6 +56,7 @@
+   app: ComputerAppInfo
+   window: ComputerWindowInfo
+   coordinateSpace: 'window'
++  backend?: 'cua' | 'cua-vm' | 'orca'
+   treeText: string
+   elementCount: number
+   focusedElementId: number | null
+@@ -151,6 +152,7 @@
+ export type ComputerProviderCapabilities = {
+   platform: NodeJS.Platform
+   provider: string
++  backend?: 'cua' | 'cua-vm' | 'orca'
+   providerVersion: string
+   protocolVersion: number
+   supports: {
+diff --git a/src/cli/computer/computer-format.ts b/src/cli/computer/computer-format.ts
+--- a/src/cli/computer/computer-format.ts
++++ b/src/cli/computer/computer-format.ts
+@@ -176,6 +176,7 @@
+     '--app',
+     quoteCliCommandArgument(result.snapshot.app.bundleId ?? result.snapshot.app.name)
+   ]
++  if (result.snapshot.backend) args.push('--backend', result.snapshot.backend)
+   if (target.session) {
+     args.push('--session', quoteCliCommandArgument(target.session))
+   } else if (target.worktree) {
+@@ -184,7 +185,12 @@
+   const windowChanged =
+     result.action?.verification?.state === 'unverified' &&
+     result.action.verification.reason === 'window_changed'
+-  if (!windowChanged && target.windowId !== undefined) {
++  const observedDifferentWindow =
++    result.snapshot.backend === 'cua-vm' && result.snapshot.window.id != null &&
++    result.action?.targetWindowId != null && result.snapshot.window.id !== result.action.targetWindowId
++  if (observedDifferentWindow) {
++    args.push('--window-id', String(result.snapshot.window.id))
++  } else if (!windowChanged && target.windowId !== undefined) {
+     args.push('--window-id', String(target.windowId))
+   } else if (!windowChanged && target.windowIndex !== undefined) {
+     args.push('--window-index', String(target.windowIndex))

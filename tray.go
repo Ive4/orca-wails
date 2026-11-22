@@ -139,6 +139,10 @@ func (d *desktop) closePanel(expected *trayPanel) {
 }
 
 func (d *desktop) serveAssets(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/desktop/") {
+		d.serveDesktopAssets(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -228,6 +232,8 @@ func (d *desktop) panelSnapshot(page string) map[string]any {
 	}
 	autostart, notifications := d.autostart, d.notifications
 	entries := d.entries
+	computerUse := d.computerUse
+	globalShortcut := d.cfg.GlobalShortcut
 	d.statusMu.RUnlock()
 
 	win, busy := d.window.Load(), d.busy.Load()
@@ -240,6 +246,8 @@ func (d *desktop) panelSnapshot(page string) map[string]any {
 		result["autostart"] = autostart
 		result["notifications"] = notifications
 		result["entries"] = entries
+		result["computerUse"] = computerUse
+		result["globalShortcut"] = globalShortcut
 		result["windowOpen"] = win != nil
 		result["localWindowReady"] = win != nil && !win.paired && win.ready.Load()
 		result["running"] = status.Phase == "running"

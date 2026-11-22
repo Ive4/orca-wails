@@ -1,0 +1,92 @@
+--- a/src/main/runtime/rpc/server/runtime-rpc-request-admission.ts
++++ b/src/main/runtime/rpc/server/runtime-rpc-request-admission.ts
+@@ -1,3 +1,5 @@
++import { timingSafeEqual } from 'node:crypto'
++import { closeSync, fstatSync, readSync } from 'node:fs'
+ import type { RuntimeMetadata } from '../../../../shared/remote-runtime/bootstrap/runtime-bootstrap'
+ import { writeRuntimeMetadata } from './runtime-metadata'
+ import type { RpcMessageContext } from '../transport'
+@@ -6,8 +8,59 @@
+ import { RuntimeRpcBinaryRouting } from './runtime-rpc-binary-routing'
+ import { classifyRuntimeLongPoll, type RuntimeLongPollClass } from './runtime-rpc-long-poll'
+ import { OWNER_RPC_CALLER_SCOPE, type RpcCallerScope } from '../callers/rpc-caller-scope'
+-import { LOCAL_CLI_RPC_CALLER } from '../callers/rpc-caller-identity'
++import { DESKTOP_RPC_CALLER, LOCAL_CLI_RPC_CALLER } from '../callers/rpc-caller-identity'
+ 
++const WAILS_QUESTION_KEY_FD = 'ORCA_WAILS_QUESTION_KEY_FD'
++const WAILS_QUESTION_KEY_LENGTH = 64
++const WAILS_QUESTION_KEY_FORMAT = /^[0-9a-f]{64}$/
++const WAILS_QUESTION_METHODS = new Set([
++  'agentSession.history',
++  'agentSession.item',
++  'agentSession.respondToQuestion',
++  'agent.read'
++])
++
++function readWailsQuestionKey(): Buffer | undefined {
++  const inherited = process.env[WAILS_QUESTION_KEY_FD]
++  delete process.env[WAILS_QUESTION_KEY_FD]
++  if (inherited !== '3') {
++    return undefined
++  }
++  const fd = 3
++  try {
++    if (!fstatSync(fd).isFIFO()) {
++      return undefined
++    }
++    try {
++      // The desktop launcher writes and closes the pipe before starting Core.
++      const contents = Buffer.alloc(WAILS_QUESTION_KEY_LENGTH + 1)
++      if (readSync(fd, contents, 0, contents.length, null) !== WAILS_QUESTION_KEY_LENGTH) {
++        return undefined
++      }
++      const key = contents.subarray(0, WAILS_QUESTION_KEY_LENGTH)
++      return WAILS_QUESTION_KEY_FORMAT.test(key.toString('latin1')) ? key : undefined
++    } finally {
++      closeSync(fd)
++    }
++  } catch {
++    return undefined
++  }
++}
++
++const wailsQuestionKey = readWailsQuestionKey()
++
++function isWailsQuestionCall(callerScope: RpcCallerScope, method: string, key: unknown): boolean {
++  return (
++    callerScope.kind === 'owner' &&
++    WAILS_QUESTION_METHODS.has(method) &&
++    wailsQuestionKey !== undefined &&
++    typeof key === 'string' &&
++    key.length === WAILS_QUESTION_KEY_LENGTH &&
++    WAILS_QUESTION_KEY_FORMAT.test(key) &&
++    timingSafeEqual(wailsQuestionKey, Buffer.from(key, 'latin1'))
++  )
++}
++
+ // Short calls that stop on disconnect without long-poll keepalives or admission slots.
+ const DISCONNECT_FORWARDED_METHODS = new Set([
+   'browser.eval',
+@@ -30,7 +83,10 @@
+     if ('error' in parsed) {
+       return parsed.error
+     }
+-    const { request, callerScope } = parsed
++    const { callerScope } = parsed
++    const { wailsQuestionKey: presentedKey, ...request } = parsed.request as RpcRequest & {
++      wailsQuestionKey?: unknown
++    }
+ 
+     // Only long polls consume admission slots; short RPCs bypass (design §7).
+     const longPoll = classifyRuntimeLongPoll(request)
+@@ -52,7 +108,9 @@
+             ? context?.signal
+             : undefined,
+         connectionSignal: context?.signal,
+-        caller: LOCAL_CLI_RPC_CALLER,
++        caller: isWailsQuestionCall(callerScope, request.method, presentedKey)
++          ? DESKTOP_RPC_CALLER
++          : LOCAL_CLI_RPC_CALLER,
+         callerScope,
+         pairingOffers: callerScope.kind === 'owner' ? this.ownerPairingOffers() : undefined
+       })

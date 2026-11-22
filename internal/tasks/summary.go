@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -38,8 +39,14 @@ func parseResponse(raw []byte, runtimeID string) (Summary, error) {
 		}
 	}
 
+	now := uint64(time.Now().UnixMilli())
 	for _, worktree := range listing.worktrees {
 		workspace := firstLabel("工作区", worktree.displayName)
+		local := worktree.hostID == nil || localHost(*worktree.hostID, runtimeID)
+		var workspaceKey string
+		if worktree.worktreeID != "" {
+			workspaceKey, _ = rowID(worktree.worktreeID, worktree.hostID, "")
+		}
 		for _, agent := range worktree.agents {
 			id, err := rowID(worktree.worktreeID, worktree.hostID, agent.paneKey)
 			if err != nil {
@@ -50,19 +57,55 @@ func parseResponse(raw []byte, runtimeID string) (Summary, error) {
 				leaf := agent.paneKey[i+1:]
 				target.TabID = agent.paneKey[:i]
 				target.LeafID = &leaf
+				if agent.structuredHostOwned && agent.conversationID != "" && leaf == structuredLeafID(agent.conversationID) {
+					target.ChatSessionID = agent.conversationID
+				}
 			}
-			summary.Rows = append(summary.Rows, Row{
-				ID:        id,
-				Title:     firstLabel("未命名任务", agent.taskTitle, agent.conversationName, agent.displayName),
-				Workspace: workspace,
-				Provider:  label(agent.agentType),
-				Status:    rowStatus(agent),
-				StartedAt: agent.stateStartedAt,
-				UpdatedAt: agent.updatedAt,
-				Target:    target,
-				QuickReply: rowStatus(agent) == Waiting && target.StructuredSessionID() != "" &&
-					(worktree.hostID == nil || *worktree.hostID == "local" || *worktree.hostID == "runtime:"+runtimeID),
-			})
+			status := rowStatus(agent)
+			row := Row{
+				ID:             id,
+				Title:          firstLabel("未命名任务", agent.taskTitle, agent.conversationName, agent.displayName),
+				Workspace:      workspace,
+				WorkspaceKey:   workspaceKey,
+				Provider:       label(agent.agentType),
+				Status:         status,
+				StartedAt:      agent.stateStartedAt,
+				UpdatedAt:      agent.updatedAt,
+				Target:         target,
+				QuickReply:     local && (status == Waiting || status == Blocked) && target.StructuredSessionID() != "",
+				Local:          local,
+				ConversationID: agent.conversationID,
+				LastResult:     agent.lastAssistantMessage,
+			}
+			if status == Working || status == Monitoring {
+				row.CurrentTool = label(agent.toolName)
+			}
+			if status == Working && local && agent.structuredHostOwned && target.StructuredSessionID() != "" {
+				row.OutputMetrics = parseOutputMetrics(agent.outputMetrics, now)
+			}
+			if local && target.StructuredSessionID() == "" && !strings.HasPrefix(agent.address, "id:") {
+				row.TerminalAddress = agent.address
+			}
+			if local {
+				launchIdentity := agent.paneKey
+				if sessionID := target.StructuredSessionID(); sessionID != "" {
+					launchIdentity = structuredTabPrefix + sessionID
+				}
+				row.LaunchKey, _ = rowID(worktree.worktreeID, nil, launchIdentity)
+			}
+			if status == Done {
+				if agent.mainAgent != nil && agent.mainAgent.State == "done" {
+					row.Outcome = agent.mainAgent.Outcome
+				}
+				if row.Outcome == "" && agent.interrupted {
+					row.Outcome = "cancellation"
+				}
+				if agent.completedAt != nil && *agent.completedAt > 0 {
+					row.StartedAt = agent.completedAt
+				}
+				row.CompletedDurationSeconds = agent.completedDurationSeconds
+			}
+			summary.Rows = append(summary.Rows, row)
 		}
 	}
 
@@ -76,6 +119,10 @@ func parseResponse(raw []byte, runtimeID string) (Summary, error) {
 		return a != nil && (b == nil || *a > *b)
 	})
 	return summary, nil
+}
+
+func localHost(hostID, runtimeID string) bool {
+	return hostID == "" || hostID == "local" || hostID == "runtime:"+runtimeID
 }
 
 func rowStatus(agent agent) Status {

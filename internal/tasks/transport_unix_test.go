@@ -34,6 +34,96 @@ func TestSocketPeerMismatchSendsNoToken(t *testing.T) {
 	}
 }
 
+func TestCallLocalBindsResponseToOwnedRuntime(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		peer string
+	}{
+		{"owned", "rt_test"},
+		{"different runtime", "other-runtime"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, listener := localSocket(t)
+			pid := uint32(os.Getpid())
+			socketMetadata(t, dir, listener, pid)
+			server := make(chan error, 1)
+			go func() {
+				conn, err := listener.AcceptUnix()
+				if err != nil {
+					server <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(time.Second))
+				var request struct{ ID, Method, AuthToken string }
+				if err := json.NewDecoder(conn).Decode(&request); err != nil {
+					server <- err
+					return
+				}
+				if request.Method != "status.get" || request.AuthToken != "test-token" {
+					server <- fmt.Errorf("unexpected local request")
+					return
+				}
+				_, err = fmt.Fprintf(conn, "{\"id\":%q,\"ok\":true,\"_meta\":{\"runtimeId\":%q},\"result\":{}}\n", request.ID, test.peer)
+				server <- err
+			}()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			frame, err := CallLocal(ctx, dir, pid, "status.get", nil)
+			if test.name == "owned" {
+				if err != nil || !json.Valid(frame) {
+					t.Fatalf("CallLocal = %s, %v", frame, err)
+				}
+			} else if err == nil {
+				t.Fatal("response from the wrong runtime was accepted")
+			}
+			if err := <-server; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSubscribeLocalYieldsAllFramesAndClosesOnCancel(t *testing.T) {
+	dir, listener := localSocket(t)
+	pid := uint32(os.Getpid())
+	socketMetadata(t, dir, listener, pid)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		conn := acceptSocket(t, listener)
+		defer conn.Close()
+		var request struct {
+			ID           string
+			WailsDesktop bool
+		}
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if json.NewDecoder(conn).Decode(&request) != nil || !request.WailsDesktop {
+			return
+		}
+		for _, line := range []string{"one", "two"} {
+			_, _ = fmt.Fprintf(conn, "{\"id\":%q,\"ok\":true,\"_meta\":{\"runtimeId\":\"rt_test\"},\"result\":%q}\n", request.ID, line)
+		}
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	stream, err := SubscribeLocal(ctx, dir, pid, "terminal.subscribe", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	for _, want := range []string{"one", "two"} {
+		frame, err := stream.Next()
+		var result struct{ Result string }
+		if err != nil || json.Unmarshal(frame, &result) != nil || result.Result != want {
+			t.Fatalf("stream frame = %s, %v, want %q", frame, err, want)
+		}
+	}
+	cancel()
+	if _, err := stream.Next(); err != context.Canceled {
+		t.Fatalf("stream after cancellation = %v", err)
+	}
+}
+
 func TestReadSocketProtocol(t *testing.T) {
 	dir, listener := localSocket(t)
 	pid := uint32(os.Getpid())
@@ -71,7 +161,8 @@ func TestReadSocketProtocol(t *testing.T) {
 			done <- fmt.Errorf("unexpected worktree.ps request")
 			return
 		}
-		_, err = io.WriteString(conn, strings.ReplaceAll(listingFixture, "\n", "")+"\nignored\n")
+		_, err = io.WriteString(conn, "{\"_keepalive\":true}\n{\"_keepalive\":true}\n"+
+			strings.ReplaceAll(listingFixture, "\n", "")+"\nignored\n")
 		done <- err
 	}()
 	summary, err := Read(t.Context(), dir, pid)

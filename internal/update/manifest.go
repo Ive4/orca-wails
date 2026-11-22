@@ -21,6 +21,8 @@ type Manifest struct {
 	WorkingDirectory string            `json:"working_directory"`
 	HealthPath       string            `json:"health_path"`
 	UIPath           string            `json:"ui_path"`
+	DesktopProtocol  uint32            `json:"desktop_protocol,omitempty"`
+	ShellSettings    bool              `json:"shell_settings,omitempty"`
 	Args             []string          `json:"args"`
 	Environment      map[string]string `json:"environment"`
 }

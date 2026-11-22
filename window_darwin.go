@@ -10,12 +10,14 @@ package main
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
+
 @protocol OrcaWebviewHost <NSObject>
 @property(readonly) WKWebView *webView;
 @end
 
 @interface OrcaNavigation : NSObject <WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandlerWithReply>
 @property(nonatomic, strong) NSURL *origin;
+@property(nonatomic, copy) NSString *pagePath;
 @property(nonatomic, strong) id<WKNavigationDelegate, WKUIDelegate> upstream;
 @property(nonatomic, strong) NSWindow *htmlPreview;
 @end
@@ -30,6 +32,7 @@ package main
 #if !__has_feature(objc_arc)
     [_htmlPreview release];
     [_origin release];
+    [_pagePath release];
     [_upstream release];
     [super dealloc];
 #endif
@@ -47,7 +50,7 @@ package main
     return !url.user && !url.password &&
         [url.scheme isEqualToString:self.origin.scheme] &&
         [url.host isEqualToString:self.origin.host] &&
-        [url.port isEqualToNumber:self.origin.port];
+        (self.origin.port ? [url.port isEqualToNumber:self.origin.port] : url.port == nil);
 }
 
 - (BOOL)previewHTMLAtPath:(NSString *)path {
@@ -104,7 +107,7 @@ package main
     NSURL *page = frame.request.URL;
     WKSecurityOrigin *sender = frame.securityOrigin;
     if (!frame.mainFrame || ![self matchesOrigin:page] ||
-        ![page.path isEqualToString:@"/web-index.html"] ||
+        ![page.path isEqualToString:self.pagePath] ||
         ![sender.protocol isEqualToString:self.origin.scheme] ||
         ![sender.host isEqualToString:self.origin.host] || sender.port != self.origin.port.integerValue) {
         reply(@{@"ok": @NO, @"reason": @"remote-runtime-unsupported"}, nil);
@@ -130,10 +133,14 @@ package main
     reply(@{@"ok": @YES}, nil);
 }
 
-- (void)openLink:(WKNavigationAction *)action {
-    NSURL *url = action.request.URL;
-    if (action.navigationType == WKNavigationTypeLinkActivated && url.host &&
-        !url.user && !url.password &&
+- (void)webView:(WKWebView *)view didStartProvisionalNavigation:(WKNavigation *)navigation {
+    if ([self.upstream respondsToSelector:_cmd]) {
+        [self.upstream webView:view didStartProvisionalNavigation:navigation];
+    }
+}
+
+- (void)openExternalURL:(NSURL *)url {
+    if (url.host.length > 0 && !url.user && !url.password &&
         ([url.scheme isEqualToString:@"https"] || [url.scheme isEqualToString:@"http"])) {
         [[NSWorkspace sharedWorkspace] openURL:url];
     }
@@ -147,25 +154,52 @@ package main
         decision(WKNavigationActionPolicyAllow);
         return;
     }
-    [self openLink:action];
+    if (action.navigationType == WKNavigationTypeLinkActivated) {
+        [self openExternalURL:action.request.URL];
+    }
     decision(WKNavigationActionPolicyCancel);
 }
 
 - (WKWebView *)webView:(WKWebView *)view createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration
         forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)features {
-    [self openLink:action];
+    // Orca's shell actions call window.open from the main page with a WebKit user gesture.
+    WKFrameInfo *source = action.sourceFrame;
+    NSURL *page = source.request.URL;
+    if (action.navigationType == WKNavigationTypeLinkActivated ||
+        (action.navigationType == WKNavigationTypeOther && source.mainFrame &&
+         [self matchesOrigin:page] && [page.path isEqualToString:self.pagePath])) {
+        [self openExternalURL:action.request.URL];
+    }
     return nil;
 }
 @end
 
 static char orcaNavigationKey;
-static bool installOrcaWebview(void *pointer, const char *origin, const char *script, bool finder) {
+static BOOL (*webViewAcceptsFirstMouse)(id, SEL, NSEvent *);
+
+static BOOL orcaAcceptsFirstMouse(id view, SEL selector, NSEvent *event) {
+    if (event.type == NSEventTypeLeftMouseDown && objc_getAssociatedObject(view, &orcaNavigationKey)) {
+        return YES;
+    }
+    return webViewAcceptsFirstMouse(view, selector, event);
+}
+
+static bool installOrcaWebview(void *pointer, const char *origin, const char *path, const char *script, bool finder) {
     id<OrcaWebviewHost> window = (__bridge id<OrcaWebviewHost>)pointer;
     if (!window || ![window respondsToSelector:@selector(webView)]) return false;
     WKWebView *view = window.webView;
     if (!view) return false;
+    // Opt the main WebView into first-click delivery while keeping Wails' KVO subclass.
+    static dispatch_once_t firstMouseInstalled;
+    dispatch_once(&firstMouseInstalled, ^{
+        SEL selector = @selector(acceptsFirstMouse:);
+        Method method = class_getInstanceMethod(WKWebView.class, selector);
+        webViewAcceptsFirstMouse = (BOOL (*)(id, SEL, NSEvent *))method_getImplementation(method);
+        class_replaceMethod(WKWebView.class, selector, (IMP)orcaAcceptsFirstMouse, method_getTypeEncoding(method));
+    });
     OrcaNavigation *delegate = [OrcaNavigation new];
     delegate.origin = [NSURL URLWithString:[NSString stringWithUTF8String:origin]];
+    delegate.pagePath = [NSString stringWithUTF8String:path];
     delegate.upstream = (id<WKNavigationDelegate, WKUIDelegate>)view.navigationDelegate;
     objc_setAssociatedObject(view, &orcaNavigationKey, delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     view.navigationDelegate = delegate;
@@ -194,7 +228,7 @@ static bool orcaPageLoaded(void *pointer) {
     id<OrcaWebviewHost> window = (__bridge id<OrcaWebviewHost>)pointer;
     WKWebView *view = window.webView;
     OrcaNavigation *delegate = objc_getAssociatedObject(view, &orcaNavigationKey);
-    return [delegate matchesOrigin:view.URL] && [view.URL.path isEqualToString:@"/web-index.html"];
+    return [delegate matchesOrigin:view.URL] && [view.URL.path isEqualToString:delegate.pagePath];
 }
 
 static void orcaEvaluate(void *pointer, const char *script) {
@@ -202,10 +236,82 @@ static void orcaEvaluate(void *pointer, const char *script) {
     id<OrcaWebviewHost> window = (__bridge id<OrcaWebviewHost>)pointer;
     [window.webView evaluateJavaScript:[NSString stringWithUTF8String:script] completionHandler:nil];
 }
+
+// Read the previous origin's storage using an inert document and the same
+// website data store that was used by the main window.
+@interface OrcaLegacyStorage : NSObject <WKNavigationDelegate>
+@property(nonatomic, strong) WKWebView *source;
+@property(nonatomic, strong) WKWebView *target;
+@property(nonatomic, strong) NSURL *page;
+@property(nonatomic, copy) NSString *exportScript;
+@property(nonatomic) BOOL finished;
+@end
+
+@implementation OrcaLegacyStorage
+- (void)dealloc {
+    [_source release];
+    [_target release];
+    [_page release];
+    [_exportScript release];
+    [super dealloc];
+}
+
+- (void)finish:(NSString *)snapshot {
+    if (self.finished) return;
+    self.finished = YES;
+    self.source.navigationDelegate = nil;
+    [self.source stopLoading];
+    self.source = nil;
+    NSData *data = [snapshot dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length && data.length <= (2 << 20)) {
+        NSString *encoded = [data base64EncodedStringWithOptions:0];
+        NSString *script = [NSString stringWithFormat:
+            @"(() => { if (location.protocol + '//' + location.host !== 'wails://localhost' || location.pathname !== '/desktop/index.html') return;"
+             "try { const marker = 'orca.wails.desktopStorageMigrated.v1';"
+             "if (localStorage.getItem(marker)) return;"
+             "const bytes = Uint8Array.from(atob('%@'), c => c.charCodeAt(0));"
+             "const snapshot = JSON.parse(new TextDecoder().decode(bytes));"
+             "for (const [key, value] of Object.entries(snapshot))"
+             "if (localStorage.getItem(key) === null) localStorage.setItem(key, value);"
+             "localStorage.setItem(marker, '1'); } catch {} })();", encoded];
+        WKUserScript *import = [[[WKUserScript alloc] initWithSource:script
+            injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES] autorelease];
+        [self.target.configuration.userContentController addUserScript:import];
+    }
+    [self.target loadRequest:[NSURLRequest requestWithURL:self.page]];
+    self.target = nil;
+}
+
+- (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)navigation {
+    [view evaluateJavaScript:self.exportScript completionHandler:^(id result, NSError *error) {
+        [self finish:!error && [result isKindOfClass:NSString.class] ? result : nil];
+    }];
+}
+@end
+
+static void orcaLoadDesktopWithLegacyStorage(void *pointer, const char *page,
+                                            unsigned short port, const char *script) {
+    id<OrcaWebviewHost> window = (__bridge id<OrcaWebviewHost>)pointer;
+    OrcaLegacyStorage *migration = [[[OrcaLegacyStorage alloc] init] autorelease];
+    migration.target = window.webView;
+    migration.page = [NSURL URLWithString:[NSString stringWithUTF8String:page]];
+    migration.exportScript = [NSString stringWithUTF8String:script];
+    WKWebViewConfiguration *config = [[[WKWebViewConfiguration alloc] init] autorelease];
+    config.websiteDataStore = migration.target.configuration.websiteDataStore;
+    migration.source = [[[WKWebView alloc] initWithFrame:NSZeroRect configuration:config] autorelease];
+    migration.source.navigationDelegate = migration;
+    NSString *origin = [NSString stringWithFormat:@"http://127.0.0.1:%hu/web-index.html", port];
+    [migration.source loadHTMLString:@"<!doctype html><meta charset=utf-8><title>Orca</title>"
+                             baseURL:[NSURL URLWithString:origin]];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [migration finish:nil];
+    });
+}
 */
 import "C"
 
 import (
+	_ "embed"
 	"encoding/json"
 	"net/url"
 	"unsafe"
@@ -214,15 +320,21 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/events"
 )
 
-func configureOrcaWindow(_ *application.WebviewWindowOptions, _ string, _ *url.URL) {}
+//go:embed assets/desktop-storage-migration.js
+var desktopStorageExport string
 
-func loadOrcaWindow(window *application.WebviewWindow, page *url.URL, script string, show func()) error {
+func configureOrcaWindow(options *application.WebviewWindowOptions, _ string, _ *url.URL) {
+	options.Mac.WebviewPreferences.JavaScriptCanOpenWindowsAutomatically = application.Disabled
+}
+
+func loadOrcaWindow(window *application.WebviewWindow, page *url.URL, script string, legacy legacyDesktopStorage, show func()) error {
 	pageOrigin := page.Scheme + "://" + page.Host
-	finder := page.Hostname() == "127.0.0.1"
+	finder := page.Hostname() == "127.0.0.1" || page.Path == desktopIndex
 	if finder {
 		originJSON, _ := json.Marshal(pageOrigin)
-		script = `if (window.top === window && location.origin === ` + string(originJSON) + ` &&
-location.pathname === "/web-index.html") {
+		pathJSON, _ := json.Marshal(page.Path)
+		script = `if (window.top === window && location.protocol + '//' + location.host === ` + string(originJSON) + ` &&
+location.pathname === ` + string(pathJSON) + `) {
   const finder = window.webkit.messageHandlers.orcaRevealInFinder;
   Object.defineProperty(window, "__orcaWailsRevealInFinder", { value: path => finder.postMessage(path) });
   const preview = window.webkit.messageHandlers.orcaPreviewHTML;
@@ -232,9 +344,11 @@ location.pathname === "/web-index.html") {
 	}
 	origin := C.CString(pageOrigin)
 	defer C.free(unsafe.Pointer(origin))
+	path := C.CString(page.Path)
+	defer C.free(unsafe.Pointer(path))
 	source := C.CString(script)
 	defer C.free(unsafe.Pointer(source))
-	if !C.installOrcaWebview(window.NativeWindow(), origin, source, C.bool(finder)) {
+	if !C.installOrcaWebview(window.NativeWindow(), origin, path, source, C.bool(finder)) {
 		return browserUnavailable()
 	}
 	window.OnWindowEvent(events.Mac.WebViewDidFinishNavigation, func(*application.WindowEvent) {
@@ -244,7 +358,16 @@ location.pathname === "/web-index.html") {
 			}
 		})
 	})
-	window.SetURL(page.String())
+	if legacy.Port == 0 || (legacy.InstallationID == "" && legacy.PublicKey == "") {
+		window.SetURL(page.String())
+	} else {
+		identity, _ := json.Marshal(legacy)
+		pageURL := C.CString(page.String())
+		export := C.CString(desktopStorageExport + "(" + string(identity) + ");")
+		defer C.free(unsafe.Pointer(pageURL))
+		defer C.free(unsafe.Pointer(export))
+		C.orcaLoadDesktopWithLegacyStorage(window.NativeWindow(), pageURL, C.ushort(legacy.Port), export)
+	}
 	return nil
 }
 

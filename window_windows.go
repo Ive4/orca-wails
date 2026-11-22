@@ -13,9 +13,10 @@ func configureOrcaWindow(options *application.WebviewWindowOptions, script strin
 	// Wails registers its document-start JS with WebView2 in the HTML launch path.
 	options.HTML = "<!doctype html><title>Orca</title>"
 	origin, _ := json.Marshal(page.Scheme + "://" + page.Host)
+	path, _ := json.Marshal(page.Path)
 	options.JS = script + `
 (() => {
-  if (window.top !== window || location.origin !== ` + string(origin) + ` || location.pathname !== "/web-index.html") return;
+  if (window.top !== window || location.origin !== ` + string(origin) + ` || location.pathname !== ` + string(path) + `) return;
   window.navigation?.addEventListener("navigate", event => {
     const next = new URL(event.destination.url);
     if (next.origin !== location.origin && event.cancelable) {
@@ -30,7 +31,7 @@ func configureOrcaWindow(options *application.WebviewWindowOptions, script strin
 `
 }
 
-func loadOrcaWindow(window *application.WebviewWindow, page *url.URL, _ string, _ func()) error {
+func loadOrcaWindow(window *application.WebviewWindow, page *url.URL, _ string, _ legacyDesktopStorage, _ func()) error {
 	var once sync.Once
 	window.OnWindowEvent(events.Windows.WebViewNavigationCompleted, func(*application.WindowEvent) {
 		once.Do(func() { window.SetURL(page.String()) })

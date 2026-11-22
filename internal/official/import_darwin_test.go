@@ -124,6 +124,36 @@ SELECT json_extract(changes_json,'$.attachment') FROM journal_events;`,
 	wantSQL(t, source, "agent-session-domain.db", "SELECT card FROM journal_queue_cards;", "pending")
 }
 
+func TestPrepareLeavesUnsentConnectorRepliesAtSource(t *testing.T) {
+	source, target, _ := importFixture(t)
+	sqlite(t, source, sessionDB, historyFixture+`
+CREATE TABLE journal_connector_replies (
+    account TEXT NOT NULL, delivery_id TEXT NOT NULL, source TEXT NOT NULL,
+    external_id TEXT NOT NULL, session_id TEXT NOT NULL, epoch TEXT NOT NULL,
+    message_id TEXT NOT NULL, queued INTEGER NOT NULL, outcome TEXT,
+    answer_delivery_id TEXT, turn_item_id TEXT, prose TEXT, failure_json TEXT, links_json TEXT,
+    filled_at INTEGER, sent_at INTEGER, took_ms INTEGER, cut_turn_id TEXT, cut_kind TEXT,
+    claim_message_id TEXT, PRIMARY KEY(account, delivery_id)
+) WITHOUT ROWID;
+INSERT INTO journal_connector_replies (
+    account, delivery_id, source, external_id, session_id, epoch, message_id, queued,
+    outcome, filled_at, sent_at, claim_message_id
+) VALUES
+    ('account','claimed','slack','thread','session','epoch','m1',1,NULL,NULL,NULL,'continuation'),
+    ('account','pending','slack','thread','session','epoch','m2',0,'answered',1,NULL,NULL),
+    ('account','sent','slack','thread','session','epoch','m3',0,'answered',1,2,NULL);
+`)
+	staging, err := Prepare(source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(staging) })
+
+	const replies = "SELECT delivery_id FROM journal_connector_replies ORDER BY delivery_id;"
+	wantSQL(t, staging, sessionDB, replies, "sent")
+	wantSQL(t, source, sessionDB, replies, "claimed\npending\nsent")
+}
+
 func TestPrepareReadsCommittedWAL(t *testing.T) {
 	source, target, profile := importFixture(t)
 	database := filepath.Join(profile, "profile-state.db")

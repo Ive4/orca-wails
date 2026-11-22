@@ -21,6 +21,7 @@ public_key="${ORCA_WAILS_UPDATE_PUBLIC_KEY:-}"
 
 identity="${ORCA_WAILS_SIGN_IDENTITY:-}"
 signing_options=(--options runtime --timestamp)
+local_signing=0
 local_identity="$HOME/Library/Application Support/Orca-Wails/signing-identity"
 if [[ -z "$identity" && "$bundle_id" == dev.orca-wails.desktop && -f "$local_identity" ]]; then
   identity="$(cat "$local_identity")"
@@ -29,6 +30,7 @@ if [[ -z "$identity" && "$bundle_id" == dev.orca-wails.desktop && -f "$local_ide
     exit 1
   fi
   signing_options=(--timestamp=none)
+  local_signing=1
 fi
 
 seed=
@@ -42,7 +44,8 @@ case "${1:-}" in
     ;;
   *)
     core_dir=dist-core/macos-arm64-bun
-    python3 scripts/extract-macos-core.py "$@" --output "$core_dir"
+    ORCA_WAILS_SIGN_IDENTITY="${identity:--}" ORCA_WAILS_LOCAL_SIGNING="$local_signing" \
+      python3 scripts/extract-macos-core.py "$@" --output "$core_dir"
     seed="$core_dir/bootstrap-core.zip"
     archive_identity="$core_dir/bootstrap-core.json"
     ;;
@@ -55,6 +58,7 @@ bundle="$stage/${app##*/}"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp build/Info.plist "$bundle/Contents/"
 cp build/icon.icns "$bundle/Contents/Resources/"
+cp -R native/macos/TaskSounds "$bundle/Contents/Resources/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$bundle/Contents/Info.plist"

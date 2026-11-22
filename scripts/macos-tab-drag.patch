@@ -8,7 +8,18 @@ diff --git a/src/renderer/src/components/tab-bar/strip/tab-strip-pointer-activat
  import { beginTabStripPointerGesture } from './tab-strip-pointer-gesture'
  import { isAgentInputMovingFocus } from '../../browser-pane/host-guest/input/agent-input-focus-guard'
  
-@@ -56,7 +56,7 @@
+@@ -42,8 +42,8 @@ export function useTabStripPointerActivation({
+       const startX = event.clientX
+       const startY = event.clientY
+       const releaseTabStripPointerGesture = beginTabStripPointerGesture()
+-      // Forgive one focus restoration when a press starts in a guest-blurred embedder; that press is leaving the guest.
+-      let pendingGuestFocusHandoff = isGuestHoldingKeyboard()
++      // A tab press can focus the WebView before pointerup, including when leaving a guest.
++      let pendingFocusHandoff = !document.hasFocus() || isGuestHoldingKeyboard()
+
+       const cleanup = (): void => {
+         window.removeEventListener('pointerup', onPointerUp)
+@@ -56,7 +56,7 @@ export function useTabStripPointerActivation({
        }
        const onPointerUp = (upEvent: PointerEvent): void => {
          const wasDrag =
@@ -17,11 +28,22 @@ diff --git a/src/renderer/src/components/tab-bar/strip/tab-strip-pointer-activat
            TAB_DRAG_ACTIVATION_DISTANCE_PX
          cleanup()
          // Use final release coordinates because packaged Chromium can deliver a stale first move after focus.
+@@ -81,8 +81,8 @@ export function useTabStripPointerActivation({
+           agentBlurPending = false
+           return
+         }
+-        if (pendingGuestFocusHandoff) {
+-          pendingGuestFocusHandoff = false
++        if (pendingFocusHandoff) {
++          pendingFocusHandoff = false
+           return
+         }
+         cleanup()
 diff --git a/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.test.tsx b/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.test.tsx
 new file mode 100644
 --- /dev/null
 +++ b/src/renderer/src/components/tab-group/drag/tab-drag-pointer-sensor.test.tsx
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,107 @@
 +// @vitest-environment happy-dom
 +
 +import { DndContext, useDraggable, useSensor } from '@dnd-kit/core'
@@ -76,6 +98,25 @@ new file mode 100644
 +afterEach(() => {
 +  fireEvent.pointerCancel(document, { pointerId: 1 })
 +  cleanup()
++  vi.restoreAllMocks()
++})
++
++it('selects the tab on the first click when the WebView takes focus during the press', () => {
++  const hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(false)
++  const { onActivate } = pressTab()
++  hasFocus.mockReturnValue(true)
++  fireEvent.focus(window)
++  fireEvent.pointerUp(document, { pointerId: 1, button: 0 })
++  expect(onActivate).toHaveBeenCalledOnce()
++})
++
++it('cancels tab selection when the window loses focus during the press', () => {
++  vi.spyOn(document, 'hasFocus').mockReturnValue(true)
++  const { onActivate } = pressTab()
++  fireEvent.blur(window)
++  fireEvent.focus(window)
++  fireEvent.pointerUp(document, { pointerId: 1, button: 0 })
++  expect(onActivate).not.toHaveBeenCalled()
 +})
 +
 +it('selects the tab when the pointer slips a few pixels during a click', () => {
@@ -175,3 +216,14 @@ diff --git a/src/renderer/src/components/tab-group/drag/useTabDragSplit.ts b/src
  
  export function canDropTabForPaneColumnSplit(args: {
    activeDrag: TabDragItemData | null
+diff --git a/src/renderer/src/components/tab-bar/strip/TabHoverCard.tsx b/src/renderer/src/components/tab-bar/strip/TabHoverCard.tsx
+--- a/src/renderer/src/components/tab-bar/strip/TabHoverCard.tsx
++++ b/src/renderer/src/components/tab-bar/strip/TabHoverCard.tsx
+@@ -64,6 +64,7 @@
+           triggerRef.current = node
+         }}
+         asChild
++        onPointerMove={(event) => event.preventDefault()}
+         onFocus={(event) => {
+           // Nested controls own their focus hints.
+           if (event.target !== event.currentTarget) {

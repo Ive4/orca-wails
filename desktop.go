@@ -51,6 +51,24 @@ func (d *desktop) setMacOSEntry(action string) error {
 	return nil
 }
 
+func (d *desktop) setComputerUse(settings computerUseSettings) error {
+	d.settingsMu.Lock()
+	defer d.settingsMu.Unlock()
+	cfg, _, err := loadConfig(d.paths.root)
+	if err != nil {
+		return err
+	}
+	cfg.computerUseSettings = settings
+	if err := saveConfig(cfg, d.paths.settings); err != nil {
+		return err
+	}
+	d.statusMu.Lock()
+	d.computerUse = settings
+	d.message = "电脑操控设置已保存"
+	d.statusMu.Unlock()
+	return nil
+}
+
 func (d *desktop) notify(message string) {
 	if !d.notificationsEnabled() || d.quitting.Load() {
 		return
@@ -82,7 +100,7 @@ func (d *desktop) dispatchRequest(request desktopRequest) {
 		case "close_orca", "toggle":
 			go d.closeOrca()
 			return
-		case "open", "open_bots":
+		case "open", "open_bots", "open_shell_settings":
 			if w := d.window.Load(); w != nil && !w.paired {
 				go func() { _ = d.showOrca(false, task, action) }()
 				return
@@ -98,7 +116,7 @@ func (d *desktop) dispatchRequest(request desktopRequest) {
 			} else {
 				d.pending.CompareAndSwap(nil, open)
 			}
-		case "open_bots", "open_notification":
+		case "open_bots", "open_notification", "open_shell_settings":
 			d.pending.Store(&request)
 		}
 		d.openPending()
@@ -112,7 +130,7 @@ func (d *desktop) dispatchRequest(request desktopRequest) {
 				d.setMessage(err.Error())
 				d.notify(err.Error())
 				switch action {
-				case "open", "open_paired", "open_bots", "open_notification", "toggle":
+				case "open", "open_paired", "open_bots", "open_notification", "open_shell_settings", "toggle":
 					if d.window.Load() == nil {
 						d.showNativeManagement()
 					}
@@ -146,7 +164,7 @@ func (d *desktop) execute(request desktopRequest) error {
 			return nil
 		}
 		fallthrough
-	case "open", "open_paired", "open_bots", "open_notification":
+	case "open", "open_paired", "open_bots", "open_notification", "open_shell_settings":
 		if err := d.ensureCore(); err != nil {
 			return err
 		}
@@ -334,12 +352,24 @@ func (d *desktop) activateSeed(current *update.Installed) (bool, error) {
 	return true, nil
 }
 
+func (d *desktop) coreLaunchSpec(cfg config, slot *update.Installed) (core.Spec, error) {
+	spec, err := cfg.launchSpec(d.paths, slot)
+	if err == nil {
+		spec.DesktopQuestionKey = d.desktopAccessKey
+		if slot.Manifest.DesktopProtocol == 1 {
+			spec.Args = append(spec.Args, "--no-pairing")
+			spec.Env["ORCA_WAILS_DESKTOP"] = "1"
+		}
+	}
+	return spec, err
+}
+
 func (d *desktop) startSlot(slot *update.Installed) error {
 	if err := d.ctx.Err(); err != nil {
 		return err
 	}
 	cfg := d.cfg
-	spec, err := cfg.launchSpec(d.paths, slot)
+	spec, err := d.coreLaunchSpec(cfg, slot)
 	if err != nil {
 		return err
 	}
@@ -347,7 +377,7 @@ func (d *desktop) startSlot(slot *update.Installed) error {
 	err = d.core.Start(d.ctx, spec)
 	if runtime.GOOS == "darwin" && cfg.Port == 6768 && errors.Is(err, core.ErrPortOccupied) {
 		cfg.Port = 16768
-		spec, err = cfg.launchSpec(d.paths, slot)
+		spec, err = d.coreLaunchSpec(cfg, slot)
 		if err == nil {
 			err = d.core.Start(d.ctx, spec)
 		}
@@ -359,12 +389,26 @@ func (d *desktop) startAndCommit(slot *update.Installed) error {
 	if err := d.startSlot(slot); err != nil {
 		return err
 	}
-	offer, port, ok := d.core.Offer()
-	if !ok {
-		return errors.New("候选内核没有提供可用的 Web 配对信息")
-	}
-	if _, err := validatedOffer(offer, port); err != nil {
-		return err
+	if slot.Manifest.DesktopProtocol == 1 {
+		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+		defer cancel()
+		status := d.core.Status()
+		ctx = tasks.WithDesktopQuestionAccess(ctx, d.desktopAccessKey)
+		result, err := tasks.CallLocal(ctx, d.paths.data, uint32(status.PID), "status.get", nil)
+		var response struct {
+			OK bool `json:"ok"`
+		}
+		if err != nil || json.Unmarshal(result, &response) != nil || !response.OK {
+			return errors.New("候选内核未通过本机桌面连接验证")
+		}
+	} else {
+		offer, port, ok := d.core.Offer()
+		if !ok {
+			return errors.New("候选内核没有提供可用的 Web 配对信息")
+		}
+		if _, err := validatedOffer(offer, port); err != nil {
+			return err
+		}
 	}
 	if err := d.ctx.Err(); err != nil {
 		return err
@@ -639,10 +683,13 @@ func (d *desktop) pollTasks() {
 			updateLights(trayTaskLights{unavailable: true})
 			continue
 		}
+		if d.wechat != nil {
+			d.wechat.Refresh()
+		}
 		lights, change := tracker.observe(summary)
 		updateLights(lights)
 		if d.nativeTray {
-			d.publishTaskNotices(change)
+			d.publishTaskChanges(change)
 		} else if notice := change.notice(); notice != "" {
 			d.notify(notice)
 		}

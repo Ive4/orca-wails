@@ -21,6 +21,7 @@ import (
 )
 
 type config struct {
+	computerUseSettings
 	Port                uint16            `json:"port"`
 	CoreDirectory       string            `json:"core_directory"`
 	UpdateRepository    string            `json:"update_repository"`
@@ -36,6 +37,11 @@ type config struct {
 	ShutdownTimeoutSecs int               `json:"shutdown_timeout_secs"`
 }
 
+type computerUseSettings struct {
+	Backend string `json:"computer_use_backend"`
+	VMSSH   string `json:"computer_use_vm_ssh"`
+}
+
 type macOSEntries struct {
 	MenuBar bool `json:"menu_bar"`
 	Notch   bool `json:"notch"`
@@ -47,13 +53,15 @@ type paths struct {
 
 func loadConfig(root string) (config, paths, error) {
 	cfg := config{
-		Port: 6768, StartCoreOnLaunch: true, OpenWindowOnStart: true,
+		computerUseSettings: computerUseSettings{Backend: "orca"},
+		Port:                6768, StartCoreOnLaunch: true, OpenWindowOnStart: true,
 		GlobalShortcut: "CommandOrControl+Shift+O", Notifications: true,
 		MacOSEntries: macOSEntries{MenuBar: true},
 		Environment:  map[string]string{}, StartupTimeoutSecs: 60, ShutdownTimeoutSecs: 8,
 	}
 	if runtime.GOOS == "darwin" {
 		cfg.Port = 16768
+		cfg.Backend = "cua"
 	}
 	p := paths{root: root, settings: filepath.Join(root, "config.json"), core: filepath.Join(root, "core"),
 		data: filepath.Join(root, "orca-data"), logs: filepath.Join(root, "logs"), webview: filepath.Join(root, "webview")}
@@ -73,7 +81,12 @@ func loadConfig(root string) (config, paths, error) {
 		}
 		decoder := json.NewDecoder(bytes.NewReader(data))
 		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&cfg); err != nil {
+		// Accept the retired WebKit setting in existing configuration files.
+		input := struct {
+			*config
+			LegacyBrowserExtensions json.RawMessage `json:"macos_browser_extensions"`
+		}{config: &cfg}
+		if err := decoder.Decode(&input); err != nil {
 			return cfg, p, fmt.Errorf("parse config.json: %w", err)
 		}
 		if decoder.Decode(new(any)) != io.EOF {
@@ -100,6 +113,7 @@ func loadConfig(root string) (config, paths, error) {
 }
 
 var repoName = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+var computerUseSSHAlias = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}$`)
 
 func (c config) validate() error {
 	if c.Port < 1024 || c.StartupTimeoutSecs < 5 || c.StartupTimeoutSecs > 300 ||
@@ -128,9 +142,20 @@ func (c config) validate() error {
 			return errors.New("download_proxy must use HTTP or HTTPS")
 		}
 	}
+	switch c.Backend {
+	case "cua", "cua-vm", "orca":
+	default:
+		return errors.New("computer_use_backend must be cua, cua-vm, or orca")
+	}
+	if c.Backend == "cua-vm" && c.VMSSH == "" {
+		return errors.New("请填写 Lume 虚拟机的 SSH 主机别名")
+	}
+	if c.VMSSH != "" && !computerUseSSHAlias.MatchString(c.VMSSH) {
+		return errors.New("SSH 主机别名请使用字母、数字、点、下划线或连字符，首字符使用字母、数字或下划线")
+	}
 	for key, value := range c.Environment {
 		switch strings.ToUpper(key) {
-		case "", "ORCA_USER_DATA", "ORCA_VERSION":
+		case "", "ORCA_USER_DATA", "ORCA_VERSION", "ORCA_WAILS_COMPUTER_USE_CONFIG_PATH", "ORCA_WAILS_BUNDLE_ID", "ORCA_WAILS_CUA_DRIVER_PATH":
 			return errors.New("invalid or reserved environment variable")
 		}
 		if strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, 0) {
@@ -186,7 +211,7 @@ func (c config) launchSpec(p paths, slot *update.Installed) (core.Spec, error) {
 			return core.Spec{}, err
 		}
 	}
-	env := make(map[string]string, len(m.Environment)+len(c.Environment)+2)
+	env := make(map[string]string, len(m.Environment)+len(c.Environment)+3)
 	for key, value := range m.Environment {
 		if env[key], err = expand(value, values); err != nil {
 			return core.Spec{}, err
@@ -201,6 +226,19 @@ func (c config) launchSpec(p paths, slot *update.Installed) (core.Spec, error) {
 			}
 		}
 		env[key] = value
+	}
+	if runtime.GOOS == "darwin" {
+		configPath, err := filepath.Abs(p.settings)
+		if err != nil {
+			return core.Spec{}, err
+		}
+		env["ORCA_WAILS_COMPUTER_USE_CONFIG_PATH"] = configPath
+		env["ORCA_WAILS_BUNDLE_ID"] = instanceID
+		if m.Environment["ORCA_WAILS_CUA_DRIVER_PATH"] == "" {
+			// Pre-Cua Cores ignore target selection. Their helper lookup accepts
+			// this existing directory, which has no Computer Use executable.
+			env["ORCA_COMPUTER_MACOS_HELPER_APP_PATH"] = cwd
+		}
 	}
 	noProxy := os.Getenv("NO_PROXY")
 	if noProxy == "" {

@@ -12,9 +12,7 @@ final class DesktopMenu: NSObject, NSMenuDelegate, NSMenuItemValidation {
         let app = NSMenu(title: "Orca-Wails")
         app.addItem(item("关于 Orca-Wails", "about"))
         app.addItem(.separator())
-        app.addItem(item("桌面设置…", "management"))
-        app.addItem(item("关于与更新…", "updates"))
-        app.addItem(item("内核维护…", "maintenance"))
+        app.addItem(item("Orca Wails 设置…", "open_shell_settings"))
         app.addItem(.separator())
         app.addItem(NSMenuItem(title: "隐藏 Orca-Wails", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         let hideOthers = NSMenuItem(title: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -151,9 +149,6 @@ final class DesktopMenu: NSObject, NSMenuDelegate, NSMenuItemValidation {
                 .applicationVersion: state.appVersion,
                 .credits: NSAttributedString(string: "Orca Core  " + (state.coreVersion.isEmpty ? "未安装" : state.coreVersion)),
             ])
-        case "updates": tray.showManagement(.about)
-        case "management": tray.showManagement()
-        case "maintenance": tray.showManagement(.advanced)
         case "import_official":
             confirm(sender.title, message: "会先备份原数据并重启内核。正在运行的任务会结束。", button: "导入", action: action)
         case "quit":

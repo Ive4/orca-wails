@@ -34,8 +34,9 @@ type trayTaskTracker struct {
 }
 
 type trayTaskChanges struct {
-	attention []tasks.Row
-	cleared   []string
+	attention                  []tasks.Row
+	cleared                    []string
+	started, resumed, finished int
 }
 
 func (change trayTaskChanges) notice() string {
@@ -54,7 +55,45 @@ func (change trayTaskChanges) notice() string {
 	if blocked > 0 {
 		notices = append(notices, fmt.Sprintf("%d 项任务受阻", blocked))
 	}
+	if change.started > 0 {
+		notices = append(notices, fmt.Sprintf("%d 项任务开始", change.started))
+	}
+	if change.resumed > 0 {
+		notices = append(notices, fmt.Sprintf("%d 项任务恢复", change.resumed))
+	}
+	if change.finished > 0 {
+		notices = append(notices, fmt.Sprintf("%d 项任务结束", change.finished))
+	}
 	return strings.Join(notices, " · ")
+}
+
+func (change trayTaskChanges) sounds() []string {
+	var blocked, waiting bool
+	for _, row := range change.attention {
+		switch row.Status {
+		case tasks.Blocked:
+			blocked = true
+		case tasks.Waiting:
+			waiting = true
+		}
+	}
+	var cues []string
+	if blocked {
+		cues = append(cues, "blocked")
+	}
+	if waiting {
+		cues = append(cues, "waiting")
+	}
+	if change.finished > 0 {
+		cues = append(cues, "finished")
+	}
+	if change.resumed > 0 {
+		cues = append(cues, "resumed")
+	}
+	if change.started > 0 {
+		cues = append(cues, "started")
+	}
+	return cues
 }
 
 func taskNeedsAttention(status tasks.Status) bool {
@@ -86,8 +125,22 @@ func (tracker *trayTaskTracker) observe(summary tasks.Summary) (trayTaskLights, 
 				status = before
 			}
 		}
-		if taskNeedsAttention(status) && previous != nil && before != status {
-			change.attention = append(change.attention, row)
+		if previous != nil && before != status {
+			switch status {
+			case tasks.Waiting, tasks.Blocked:
+				change.attention = append(change.attention, row)
+			case tasks.Working, tasks.Monitoring:
+				switch before {
+				case "", tasks.Done:
+					change.started++
+				case tasks.Waiting, tasks.Blocked:
+					change.resumed++
+				}
+			case tasks.Done:
+				if before != "" && before != tasks.Unknown {
+					change.finished++
+				}
+			}
 		}
 		if taskNeedsAttention(before) && !taskNeedsAttention(status) {
 			change.cleared = append(change.cleared, row.ID)

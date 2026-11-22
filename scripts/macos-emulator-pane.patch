@@ -1,0 +1,556 @@
+diff --git a/src/main/runtime/rpc/methods/emulator/emulator-frame-stream.test.ts b/src/main/runtime/rpc/methods/emulator/emulator-frame-stream.test.ts
+new file mode 100644
+index 0000000..0681ece
+--- /dev/null
++++ b/src/main/runtime/rpc/methods/emulator/emulator-frame-stream.test.ts
+@@ -0,0 +1,72 @@
++import { createServer } from 'node:http'
++import { expect, test, vi } from 'vitest'
++import { streamEmulatorFrames } from './emulator-frame-stream'
++
++test('delivers complete JPEG frames and closes the source on abort', async () => {
++  const controller = new AbortController()
++  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9])
++  const closed = vi.fn()
++  const server = createServer((req, res) => {
++    expect(req.url).toBe('/stream.mjpeg?raw=1')
++    res.on('close', closed)
++    res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
++    res.write(jpeg.subarray(0, 2))
++    res.write(jpeg.subarray(2))
++  })
++  try {
++    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++    const address = server.address()
++    if (!address || typeof address === 'string') throw new Error('Expected a listening socket')
++    const send = vi.fn((frame: Uint8Array<ArrayBufferLike>) => {
++      expect(Buffer.from(frame)).toEqual(jpeg)
++      controller.abort()
++      return true
++    })
++    await streamEmulatorFrames(`http://127.0.0.1:${address.port}/stream.mjpeg`, {
++      signal: controller.signal,
++      sendBinary: send,
++      onError: () => {}
++    })
++    expect(send).toHaveBeenCalledTimes(1)
++    await vi.waitFor(() => expect(closed).toHaveBeenCalledTimes(1))
++  } finally {
++    controller.abort()
++    server.closeAllConnections()
++    await new Promise<void>((resolve) => server.close(() => resolve()))
++  }
++})
++
++test('rejects remote hosts and endpoints outside the paired simulator stream', async () => {
++  const sendBinary = vi.fn(() => true)
++  for (const url of [
++    'http://192.0.2.2:5000/stream.mjpeg',
++    'http://127.0.0.1/stream.mjpeg',
++    'http://127.0.0.1:5000/control',
++    'http://user@127.0.0.1:5000/stream.mjpeg'
++  ]) {
++    await expect(streamEmulatorFrames(url, { sendBinary, onError: () => {} })).rejects.toThrow()
++  }
++  expect(sendBinary).not.toHaveBeenCalled()
++})
++
++test('ends after the local helper rejects the stream', async () => {
++  const requests = vi.fn()
++  const server = createServer((_req, res) => {
++    requests()
++    res.writeHead(503).end()
++  })
++  try {
++    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++    const address = server.address()
++    if (!address || typeof address === 'string') throw new Error('Expected a listening socket')
++    const onError = vi.fn()
++    const sendBinary = vi.fn(() => true)
++    await streamEmulatorFrames(`http://127.0.0.1:${address.port}/stream.mjpeg`, { sendBinary, onError })
++    expect(requests).toHaveBeenCalledOnce()
++    expect(onError).toHaveBeenCalledOnce()
++    expect(sendBinary).not.toHaveBeenCalled()
++  } finally {
++    server.closeAllConnections()
++    await new Promise<void>((resolve) => server.close(() => resolve()))
++  }
++})
+diff --git a/src/main/runtime/rpc/methods/emulator/emulator-frame-stream.ts b/src/main/runtime/rpc/methods/emulator/emulator-frame-stream.ts
+new file mode 100644
+index 0000000..b937f9d
+--- /dev/null
++++ b/src/main/runtime/rpc/methods/emulator/emulator-frame-stream.ts
+@@ -0,0 +1,53 @@
++import { MjpegFrameStream } from '../../../../emulator/mjpeg-frame-stream'
++import { EmulatorError } from '../../../../emulator/emulator-errors'
++import { isRemoteRuntimeBinaryFrameWithinLimit } from '../../../../../shared/remote-runtime/remote-runtime-memory-limits'
++import type { RpcBinarySender } from '../../transports/rpc-binary-sender'
++
++export async function streamEmulatorFrames(
++  streamUrl: string,
++  {
++    signal,
++    sendBinary,
++    onError
++  }: {
++    signal?: AbortSignal
++    sendBinary: RpcBinarySender
++    onError: (message: string) => void
++  }
++): Promise<void> {
++  const url = new URL(streamUrl)
++  if (
++    url.protocol !== 'http:' ||
++    !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ||
++    !url.port ||
++    url.username ||
++    url.password ||
++    url.pathname !== '/stream.mjpeg'
++  ) {
++    throw new EmulatorError('emulator_no_active', 'The iOS simulator has no local frame stream.')
++  }
++  if (signal?.aborted) return
++  let stopped!: () => void
++  const done = new Promise<void>((resolve) => {
++    stopped = resolve
++  })
++  const stream = new MjpegFrameStream(url.href, {
++    onError: () => {
++      if (!signal?.aborted) onError('The iOS simulator stream disconnected.')
++      stopped()
++    },
++    onFrame: (image) => {
++      if (!signal?.aborted && isRemoteRuntimeBinaryFrameWithinLimit(image)) {
++        sendBinary(image, { dropWhenBacklogged: true })
++      }
++    }
++  })
++  signal?.addEventListener('abort', stopped, { once: true })
++  try {
++    stream.start()
++    await done
++  } finally {
++    signal?.removeEventListener('abort', stopped)
++    stream.stop()
++  }
++}
+diff --git a/src/main/runtime/rpc/methods/emulator/emulator.ts b/src/main/runtime/rpc/methods/emulator/emulator.ts
+index 95ad45f..80cfd49 100644
+--- a/src/main/runtime/rpc/methods/emulator/emulator.ts
++++ b/src/main/runtime/rpc/methods/emulator/emulator.ts
+@@ -1,4 +1,6 @@
+-import { defineMethod } from '../../core'
++import { defineMethod, defineStreamingMethod } from '../../core'
++import { EmulatorError } from '../../../../emulator/emulator-errors'
++import { streamEmulatorFrames } from './emulator-frame-stream'
+ import path from 'node:path'
+ import { z } from 'zod'
+ import {
+@@ -6,6 +8,7 @@ import {
+   AxParams,
+   ButtonParams,
+   EmulatorAvailabilityParams,
++  EmulatorFramesParams,
+   EmulatorListDevicesParams,
+   EmulatorListSimulatorsParams,
+   EmulatorUnregisterActiveParams,
+@@ -34,6 +37,29 @@ const InstallParams = z.object({
+ })
+ 
+ export const EMULATOR_METHODS = [
++  defineStreamingMethod({
++    name: 'emulator.frames',
++    permission: 'workspace',
++    params: EmulatorFramesParams,
++    handler: async ({ worktree, device }, { runtime, signal, sendBinary }, emit) => {
++      if (!signal || !sendBinary) {
++        throw new EmulatorError('emulator_no_active', 'The iOS simulator stream is unavailable.')
++      }
++      const { sessions } = await runtime.emulatorList({ worktree })
++      const session = sessions.find(
++        (entry) => entry.deviceUdid === device && entry.backend === 'ios'
++      )
++      if (!session?.streamUrl) {
++        throw new EmulatorError('emulator_no_active', 'No active iOS simulator in this workspace.')
++      }
++      emit({ type: 'ready' })
++      await streamEmulatorFrames(session.streamUrl, {
++        signal,
++        sendBinary,
++        onError: (message) => emit({ type: 'error', message })
++      })
++    }
++  }),
+   defineMethod({
+     name: 'emulator.list',
+     permission: 'workspace',
+diff --git a/src/renderer/src/components/emulator-pane/EmulatorPane.tsx b/src/renderer/src/components/emulator-pane/EmulatorPane.tsx
+index 30e3112..da79242 100644
+--- a/src/renderer/src/components/emulator-pane/EmulatorPane.tsx
++++ b/src/renderer/src/components/emulator-pane/EmulatorPane.tsx
+@@ -7,6 +7,7 @@ import { useEmulatorPaneSession } from './session/use-emulator-pane-session'
+ import { scrcpyDeviceIdFromStreamUrl } from './streaming/emulator-scrcpy-stream-url'
+ import { useEmulatorInputCheck } from './input/use-emulator-input-check'
+ import { useTranslate } from '@/i18n/use-translate'
++import { getWailsLocalRuntimeId } from '@/runtime/hosts/display/wails-local-runtime'
+ import { useUiLanguageRevision } from '@/i18n/use-ui-language-revision'
+ 
+ type EmulatorPaneProps = {
+@@ -110,7 +111,11 @@ export default function EmulatorPane({ tab, worktreeId, isActive = true }: Emula
+             isActive={isActive}
+             onTap={(x, y) => void sendTap(x, y)}
+             onGesture={(points) => void sendGesture(points)}
+-            onStreamLost={scrcpyDeviceIdFromStreamUrl(previewUrl) ? markStreamLost : undefined}
++            onStreamLost={
++              getWailsLocalRuntimeId() || scrcpyDeviceIdFromStreamUrl(previewUrl)
++                ? markStreamLost
++                : undefined
++            }
+           />
+         </MobileEmulatorAgentSetupGuideLayer>
+       </div>
+diff --git a/src/renderer/src/components/emulator-pane/devices/use-emulator-device-inventory.ts b/src/renderer/src/components/emulator-pane/devices/use-emulator-device-inventory.ts
+index 13844b0..d69d972 100644
+--- a/src/renderer/src/components/emulator-pane/devices/use-emulator-device-inventory.ts
++++ b/src/renderer/src/components/emulator-pane/devices/use-emulator-device-inventory.ts
+@@ -6,6 +6,7 @@ import {
+   type Dispatch,
+   type SetStateAction
+ } from 'react'
++import { getWailsLocalRuntimeId } from '@/runtime/hosts/display/wails-local-runtime'
+ import { callRuntimeRpc } from '@/runtime/rpc/calls/runtime-rpc-call'
+ import { toSimulatorDeviceRows, type RawEmulatorDevice } from './emulator-device-row-mapping'
+ import { markSimulatorDeviceBooted } from './emulator-device-state'
+@@ -26,7 +27,9 @@ export function useEmulatorDeviceInventory(
+           'emulator.listDevices',
+           {}
+         )) as RawEmulatorDevice[]
+-        const list = toSimulatorDeviceRows(raw)
++        const list = toSimulatorDeviceRows(
++          getWailsLocalRuntimeId() ? raw.filter((device) => device.backend === 'ios') : raw
++        )
+         const next = markSimulatorDeviceBooted(list, bootedTarget)
+         if (!mountedRef.current) {
+           return next
+diff --git a/src/renderer/src/components/emulator-pane/frame/emulator-device-frame.tsx b/src/renderer/src/components/emulator-pane/frame/emulator-device-frame.tsx
+index b8a39dc..885a33d 100644
+--- a/src/renderer/src/components/emulator-pane/frame/emulator-device-frame.tsx
++++ b/src/renderer/src/components/emulator-pane/frame/emulator-device-frame.tsx
+@@ -350,6 +350,7 @@ export function EmulatorDeviceFrame({
+           }}
+         >
+           <EmulatorScreenSurface
++            worktreeId={worktreeId}
+             deviceId={deviceId}
+             frameLayout={frameLayout}
+             isLive={isLive}
+diff --git a/src/renderer/src/components/emulator-pane/session/use-emulator-pane-session.ts b/src/renderer/src/components/emulator-pane/session/use-emulator-pane-session.ts
+index d3d22db..062c777 100644
+--- a/src/renderer/src/components/emulator-pane/session/use-emulator-pane-session.ts
++++ b/src/renderer/src/components/emulator-pane/session/use-emulator-pane-session.ts
+@@ -5,6 +5,7 @@ import {
+ } from '../../../../../shared/emulator/emulator-opening-preferences'
+ import { supportsEmulatorOpeningPreferences } from '@/lib/simulator/launch/emulator-opening-preferences-capability'
+ import { useCallback, useEffect, useRef, useState } from 'react'
++import { getWailsLocalRuntimeId } from '@/runtime/hosts/display/wails-local-runtime'
+ import { callRuntimeRpc } from '@/runtime/rpc/calls/runtime-rpc-call'
+ import { useAppStore } from '@/store/index'
+ import {
+@@ -168,9 +169,21 @@ export function useEmulatorPaneSession({
+         if (!supportsPreferences && list.length === 0 && !deviceTarget && !configuredDefaultUdid) {
+           throw noEmulatorDevicesError()
+         }
+-        const target =
++        const preferredTarget =
+           deviceTarget ||
+           (!automatic ? (selectedUdid ?? configuredDefaultUdid ?? undefined) : undefined)
++        const target = getWailsLocalRuntimeId()
++          ? (
++              list.find((item) => item.udid === preferredTarget && item.isAvailable !== false) ??
++              list.find((item) => item.state === 'Booted' && item.isAvailable !== false) ??
++              list.find((item) => item.isAvailable !== false)
++            )?.udid
++          : preferredTarget
++        if (getWailsLocalRuntimeId() && !target) {
++          throw new Error(
++            'No iOS simulator is available. Install Xcode and an iOS Simulator runtime.'
++          )
++        }
+         requestedTarget = target
+         if (target) {
+           setSelectedUdid(target)
+diff --git a/src/renderer/src/components/emulator-pane/streaming/emulator-screen-stream-content.tsx b/src/renderer/src/components/emulator-pane/streaming/emulator-screen-stream-content.tsx
+index a465a45..95e4bed 100644
+--- a/src/renderer/src/components/emulator-pane/streaming/emulator-screen-stream-content.tsx
++++ b/src/renderer/src/components/emulator-pane/streaming/emulator-screen-stream-content.tsx
+@@ -4,6 +4,7 @@ import { useEmulatorFrameStream } from './use-emulator-frame-stream'
+ import { useEmulatorVideoStream } from './use-emulator-video-stream'
+ import { scrcpyDeviceIdFromStreamUrl } from './emulator-scrcpy-stream-url'
+ import { useTranslate } from '@/i18n/use-translate'
++import { getWailsLocalRuntimeId } from '@/runtime/hosts/display/wails-local-runtime'
+ import type { VisualStreamGeometry } from '../frame/emulator-device-frame-layout'
+ 
+ type StreamSize = {
+@@ -12,6 +13,7 @@ type StreamSize = {
+ }
+ 
+ type EmulatorScreenStreamContentProps = {
++  worktreeId?: string
+   deviceId?: string
+   loading: boolean
+   onStreamError: () => void
+@@ -25,6 +27,7 @@ type EmulatorScreenStreamContentProps = {
+ }
+ 
+ export function EmulatorScreenStreamContent({
++  worktreeId,
+   deviceId,
+   loading,
+   onStreamError,
+@@ -41,7 +44,10 @@ export function EmulatorScreenStreamContent({
+   const iosVideoSession =
+     !androidDeviceId && deviceId && previewUrl ? `${deviceId}\n${previewUrl}\n${streamKey}` : null
+   const [failedIosVideoSession, setFailedIosVideoSession] = useState<string | null>(null)
+-  const iosVideo = iosVideoSession !== null && iosVideoSession !== failedIosVideoSession
++  const iosVideo =
++    !getWailsLocalRuntimeId() &&
++    iosVideoSession !== null &&
++    iosVideoSession !== failedIosVideoSession
+   const videoDeviceId = androidDeviceId ?? (iosVideo ? deviceId : undefined)
+ 
+   const { canvasRef, error: videoError } = useEmulatorVideoStream(
+@@ -56,7 +62,9 @@ export function EmulatorScreenStreamContent({
+   const frameStream = useEmulatorFrameStream(
+     jpeg ? previewUrl : undefined,
+     streamKey,
+-    showStream && Boolean(previewUrl) && jpeg
++    showStream && Boolean(previewUrl) && jpeg,
++    worktreeId,
++    deviceId
+   )
+   const mediaError = frameStream.error ?? (androidDeviceId ? videoError : null)
+ 
+diff --git a/src/renderer/src/components/emulator-pane/streaming/emulator-screen-surface.tsx b/src/renderer/src/components/emulator-pane/streaming/emulator-screen-surface.tsx
+index 178b5ec..fd1e45b 100644
+--- a/src/renderer/src/components/emulator-pane/streaming/emulator-screen-surface.tsx
++++ b/src/renderer/src/components/emulator-pane/streaming/emulator-screen-surface.tsx
+@@ -16,6 +16,7 @@ import type {
+ import { useTranslate } from '@/i18n/use-translate'
+ 
+ type EmulatorScreenSurfaceProps = {
++  worktreeId?: string
+   deviceId?: string
+   frameLayout: DeviceFrameLayout | null
+   isLive: boolean
+@@ -40,6 +41,7 @@ type EmulatorScreenSurfaceProps = {
+ }
+ 
+ export function EmulatorScreenSurface({
++  worktreeId,
+   deviceId,
+   frameLayout,
+   isLive,
+@@ -91,6 +93,7 @@ export function EmulatorScreenSurface({
+     >
+       {/* Use the real streamed screen; extra in-screen chrome would duplicate iOS status bars and distort bezels. */}
+       <EmulatorScreenStreamContent
++        worktreeId={worktreeId}
+         deviceId={deviceId}
+         loading={loading}
+         onStreamError={onStreamError}
+diff --git a/src/renderer/src/components/emulator-pane/streaming/use-emulator-frame-stream.ts b/src/renderer/src/components/emulator-pane/streaming/use-emulator-frame-stream.ts
+index f3f1b8b..71f20df 100644
+--- a/src/renderer/src/components/emulator-pane/streaming/use-emulator-frame-stream.ts
++++ b/src/renderer/src/components/emulator-pane/streaming/use-emulator-frame-stream.ts
+@@ -1,5 +1,8 @@
+ import { useEffect, useRef, useState } from 'react'
+ import { translate } from '@/i18n/i18n'
++import { createNonSecureContextUuid } from '../../../../../shared/identifiers/non-secure-context-uuid'
++import { getWailsLocalRuntimeId } from '@/runtime/hosts/display/wails-local-runtime'
++import { subscribeRuntimeEnvironment } from '@/runtime/rpc/environment-revisions/runtime-environment-pairing-refresh'
+ 
+ const FIRST_FRAME_TIMEOUT_MS = 6_000
+ 
+@@ -24,8 +27,11 @@ function getFrameStreamIdentity(
+ export function useEmulatorFrameStream(
+   streamUrl: string | undefined,
+   streamKey: string | undefined,
+-  enabled: boolean
++  enabled: boolean,
++  worktreeId?: string,
++  deviceId?: string
+ ): Omit<EmulatorFrameStreamState, 'streamIdentity'> {
++  const wailsRuntimeId = getWailsLocalRuntimeId()
+   const streamIdentity = getFrameStreamIdentity(streamUrl, streamKey, enabled)
+   const [state, setState] = useState<EmulatorFrameStreamState>({
+     error: null,
+@@ -36,7 +42,7 @@ export function useEmulatorFrameStream(
+ 
+   useEffect(() => {
+     const emulatorApi = window.api?.emulator
+-    if (!enabled || !streamUrl || !emulatorApi?.startFrameStream) {
++    if (!enabled || !streamUrl || (!wailsRuntimeId && !emulatorApi?.startFrameStream)) {
+       setState({ error: null, frameUrl: null, streamIdentity: null })
+       return
+     }
+@@ -71,10 +77,8 @@ export function useEmulatorFrameStream(
+       }
+     }
+ 
+-    const unsubscribeFrame = emulatorApi.onFrameStreamFrame?.(({ streamId, bytes }) => {
+-      if (disposed || streamId !== activeStreamId) {
+-        return
+-      }
++    const acceptFrame = (bytes: ArrayBuffer): void => {
++      if (disposed) return
+       clearFirstFrameTimer()
+       const nextFrameUrl = createFrameUrl(bytes)
+       const previousFrameUrl = currentFrameUrlRef.current
+@@ -83,25 +87,84 @@ export function useEmulatorFrameStream(
+       if (previousFrameUrl) {
+         URL.revokeObjectURL(previousFrameUrl)
+       }
+-    })
++    }
++    const reportError = (message: string): void => {
++      if (disposed) return
++      clearFirstFrameTimer()
++      if (wailsRuntimeId) revokeCurrentFrameUrl()
++      setState((current) =>
++        current.streamIdentity === streamIdentity
++          ? {
++              ...current,
++              frameUrl: wailsRuntimeId ? null : current.frameUrl,
++              error: message || 'Stream disconnected'
++            }
++          : current
++      )
++    }
+ 
+-    const unsubscribeError = emulatorApi.onFrameStreamError?.(({ streamId, message }) => {
+-      if (!disposed && streamId === activeStreamId) {
+-        setState((current) =>
+-          current.streamIdentity === streamIdentity
+-            ? { ...current, error: message || 'Stream disconnected' }
+-            : current
+-        )
+-      }
++    const unsubscribeFrame = emulatorApi?.onFrameStreamFrame?.(({ streamId, bytes }) => {
++      if (streamId === activeStreamId) acceptFrame(bytes)
++    })
++    const unsubscribeError = emulatorApi?.onFrameStreamError?.(({ streamId, message }) => {
++      if (streamId === activeStreamId) reportError(message)
+     })
+ 
+     // Hide the previous device’s frames while the new stream starts.
+     setState({ error: null, frameUrl: null, streamIdentity })
++    if (wailsRuntimeId && worktreeId && deviceId) {
++      const subscriptionId = createNonSecureContextUuid()
++      let unsubscribe: (() => void) | undefined
++      void subscribeRuntimeEnvironment(
++        {
++          subscriptionId,
++          selector: wailsRuntimeId,
++          method: 'emulator.frames',
++          params: { worktree: worktreeId, device: deviceId },
++          timeoutMs: FIRST_FRAME_TIMEOUT_MS
++        },
++        {
++          onResponse: (response) => {
++            if (!response.ok) reportError(response.error.message)
++            else if (
++              response.result &&
++              typeof response.result === 'object' &&
++              'message' in response.result &&
++              typeof response.result.message === 'string'
++            ) {
++              reportError(response.result.message)
++            }
++          },
++          onBinary: (bytes) => acceptFrame(Uint8Array.from(bytes).buffer),
++          onError: (error) => reportError(error.message),
++          onClose: () => reportError('Stream disconnected')
++        }
++      )
++        .then((handle) => {
++          if (disposed) handle.unsubscribe()
++          else unsubscribe = handle.unsubscribe
++        })
++        .catch((error) =>
++          reportError(error instanceof Error ? error.message : 'Stream disconnected')
++        )
++      return () => {
++        disposed = true
++        if (unsubscribe) unsubscribe()
++        else
++          void window.api.runtimeEnvironments.cancelSubscription({ subscriptionId }).catch(() => {})
++
++        unsubscribeFrame?.()
++        unsubscribeError?.()
++        clearFirstFrameTimer()
++        revokeCurrentFrameUrl()
++      }
++    }
++
+     void emulatorApi
+-      .startFrameStream({ streamUrl, streamKey })
++      ?.startFrameStream({ streamUrl, streamKey })
+       .then(({ streamId }) => {
+         if (disposed) {
+-          void emulatorApi.stopFrameStream?.({ streamId })
++          void emulatorApi?.stopFrameStream?.({ streamId })
+           return
+         }
+         activeStreamId = streamId
+@@ -124,11 +187,11 @@ export function useEmulatorFrameStream(
+       unsubscribeFrame?.()
+       unsubscribeError?.()
+       if (activeStreamId) {
+-        void emulatorApi.stopFrameStream?.({ streamId: activeStreamId })
++        void emulatorApi?.stopFrameStream?.({ streamId: activeStreamId })
+       }
+       revokeCurrentFrameUrl()
+     }
+-  }, [enabled, streamIdentity, streamKey, streamUrl])
++  }, [deviceId, enabled, streamIdentity, streamKey, streamUrl, wailsRuntimeId, worktreeId])
+ 
+   if (state.streamIdentity !== streamIdentity) {
+     return { error: null, frameUrl: null }
+diff --git a/src/shared/rpc-contract/emulator/emulator-params.ts b/src/shared/rpc-contract/emulator/emulator-params.ts
+index 0a09f6c..08c064f 100644
+--- a/src/shared/rpc-contract/emulator/emulator-params.ts
++++ b/src/shared/rpc-contract/emulator/emulator-params.ts
+@@ -2,6 +2,11 @@ import { z } from 'zod'
+ 
+ export const WorktreeParam = z.object({ worktree: z.string().optional() }).partial()
+ 
++export const EmulatorFramesParams = z.object({
++  worktree: z.string().min(1),
++  device: z.string().min(1)
++})
++
+ export const TapParams = z.object({
+   x: z.number().min(0).max(1),
+   y: z.number().min(0).max(1),
+diff --git a/src/shared/rpc-contract/rpc-params-catalog.generated.ts b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+index 9744e41..d2b288a 100644
+--- a/src/shared/rpc-contract/rpc-params-catalog.generated.ts
++++ b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
+@@ -353,6 +353,7 @@ import {
+   AxParams,
+   ButtonParams,
+   EmulatorAvailabilityParams,
++  EmulatorFramesParams,
+   EmulatorListDevicesParams,
+   EmulatorListSimulatorsParams,
+   EmulatorUnregisterActiveParams,
+@@ -1530,6 +1531,7 @@ export const RPC_PARAMS_BY_METHOD = {
+   'emulator.button': ButtonParams,
+   'emulator.checkInput': ListParams,
+   'emulator.exec': ExecParams,
++  'emulator.frames': EmulatorFramesParams,
+   'emulator.gesture': GestureParams,
+   'emulator.kill': KillParams,
+   'emulator.launch': LaunchParams,
+

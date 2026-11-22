@@ -18,6 +18,7 @@ type Spec struct {
 	Args                            []string
 	Dir                             string
 	Env                             map[string]string
+	DesktopQuestionKey              string
 	Port                            uint16
 	HealthURL, LogDir, Version      string
 	StartupTimeout, ShutdownTimeout time.Duration

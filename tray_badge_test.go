@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -33,8 +34,8 @@ func TestTaskLightsReflectStatesAndReportNewAttention(t *testing.T) {
 	}}
 	lights, change = tracker.observe(changed)
 	if lights != (trayTaskLights{running: 1, waiting: 1, blocked: 1}) ||
-		change.notice() != "1 项任务等待输入 · 1 项任务受阻" {
-		t.Fatalf("changed state = %+v, %q", lights, change.notice())
+		change.notice() != "1 项任务等待输入 · 1 项任务受阻" || !slices.Equal(change.sounds(), []string{"blocked", "waiting"}) {
+		t.Fatalf("changed state = %+v, %q, sounds %v", lights, change.notice(), change.sounds())
 	}
 	if _, change = tracker.observe(changed); change.notice() != "" {
 		t.Fatalf("repeated snapshot notified again: %q", change.notice())
@@ -70,6 +71,58 @@ func TestTaskAttentionClearsOnlyAfterConfirmedResolution(t *testing.T) {
 	_, change = tracker.observe(tasks.Summary{})
 	if len(change.cleared) != 1 || change.cleared[0] != "task" {
 		t.Fatalf("missing notification removal: %+v", change)
+	}
+}
+
+func TestTaskLifecycleReportsOnlyConfirmedTransitions(t *testing.T) {
+	var tracker trayTaskTracker
+	for _, step := range []struct {
+		name   string
+		rows   []tasks.Row
+		notice string
+		sound  string
+	}{
+		{"startup", []tasks.Row{{ID: "existing", Status: tasks.Working}}, "", ""},
+		{"start", []tasks.Row{{ID: "task", Status: tasks.Working}}, "1 项任务开始", "started"},
+		{"monitoring", []tasks.Row{{ID: "task", Status: tasks.Monitoring}}, "", ""},
+		{"pause", []tasks.Row{{ID: "task", Status: tasks.Waiting}}, "1 项任务等待输入", "waiting"},
+		{"unconfirmed", []tasks.Row{{ID: "task", Status: tasks.Unknown}}, "", ""},
+		{"resume", []tasks.Row{{ID: "task", Status: tasks.Working}}, "1 项任务恢复", "resumed"},
+		{"end", []tasks.Row{{ID: "task", Status: tasks.Done}}, "1 项任务结束", "finished"},
+		{"history", []tasks.Row{{ID: "task", Status: tasks.Done}, {ID: "old", Status: tasks.Done}}, "", ""},
+		{"restart", []tasks.Row{{ID: "task", Status: tasks.Working}}, "1 项任务开始", "started"},
+		{"disappeared", nil, "", ""},
+	} {
+		_, change := tracker.observe(tasks.Summary{Rows: step.rows})
+		if got := change.notice(); got != step.notice {
+			t.Errorf("%s notice = %q, want %q", step.name, got, step.notice)
+		}
+		if got, want := change.sounds(), strings.Fields(step.sound); !slices.Equal(got, want) {
+			t.Errorf("%s sounds = %v, want %v", step.name, got, want)
+		}
+	}
+}
+
+func TestTaskSoundsIncludeEachChangedStateOnce(t *testing.T) {
+	var tracker trayTaskTracker
+	tracker.observe(tasks.Summary{Rows: []tasks.Row{
+		{ID: "wait", Status: tasks.Working},
+		{ID: "block", Status: tasks.Working},
+		{ID: "also-block", Status: tasks.Working},
+		{ID: "finish", Status: tasks.Working},
+		{ID: "resume", Status: tasks.Waiting},
+	}})
+	_, change := tracker.observe(tasks.Summary{Rows: []tasks.Row{
+		{ID: "wait", Status: tasks.Waiting},
+		{ID: "block", Status: tasks.Blocked},
+		{ID: "also-block", Status: tasks.Blocked},
+		{ID: "finish", Status: tasks.Done},
+		{ID: "resume", Status: tasks.Working},
+		{ID: "start", Status: tasks.Working},
+	}})
+	want := []string{"blocked", "waiting", "finished", "resumed", "started"}
+	if got := change.sounds(); !slices.Equal(got, want) {
+		t.Fatalf("sounds = %v, want %v", got, want)
 	}
 }
 

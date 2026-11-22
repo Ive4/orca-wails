@@ -89,9 +89,21 @@ func importHistory(source, staged, target string) error {
 		return errors.New("附件路径编码无效")
 	}
 
+	database := filepath.Join(staged, sessionDB)
+	hasOutbox, err := runSQLite(database, staged, true,
+		"SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='journal_connector_replies');")
+	if err != nil {
+		return err
+	}
+	clearOutbox := ""
+	if hasOutbox == "1" {
+		// Unsent replies belong to the original runtime, including claims held by a continuation.
+		clearOutbox = "DELETE FROM journal_connector_replies WHERE sent_at IS NULL;"
+	}
+
 	// Saved messages and identity fences are portable. Live claims and
 	// pending commands belong to the original runtime.
-	_, err = runSQLite(filepath.Join(staged, sessionDB), staged, false, fmt.Sprintf(`
+	_, err = runSQLite(database, staged, false, fmt.Sprintf(`
 BEGIN;
 UPDATE agent_session_records SET record_json = json_set(
     json_remove(replace(record_json, %[1]s, %[2]s),
@@ -105,6 +117,7 @@ DELETE FROM agent_session_retired_claim_keys;
 DELETE FROM journal_queue_cards;
 DELETE FROM journal_edit_leases;
 DELETE FROM journal_submission_attempts;
+%[5]s
 UPDATE journal_items SET
     payload_json = replace(payload_json, %[3]s, %[4]s),
     wire_json = replace(wire_json, %[3]s, %[4]s),
@@ -117,7 +130,7 @@ UPDATE journal_events SET changes_json = replace(changes_json, %[3]s, %[4]s)
     WHERE instr(changes_json, %[3]s);
 COMMIT;
 VACUUM;`, jsonPathPrefix(source), jsonPathPrefix(target),
-		jsonPathPrefix(attachmentSource), jsonPathPrefix(filepath.Join(target, attachments))))
+		jsonPathPrefix(attachmentSource), jsonPathPrefix(filepath.Join(target, attachments)), clearOutbox))
 	return err
 }
 

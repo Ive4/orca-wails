@@ -1,17 +1,17 @@
 {
-  "version": "v1.4.268",
-  "package_revision": "0.0.13",
+  "version": "v1.4.269",
+  "package_revision": "0.0.32",
   "target": "aarch64-apple-darwin",
   "upstream_target": "darwin-arm64",
   "upstream": {
-    "archive": "Orca-1.4.268-arm64-mac.zip",
-    "archive_sha256": "2b1af4bf3871033cb10b1b1053e3ea028f872e6c678993609f901f073908d903",
-    "commit": "5dc5548b4570b276f231d81fbb51f8f7a066e40d",
-    "app_build_commit": "fe1c72c721bf42f79c578ef67442a2304493b62a",
-    "source_archive_sha256": "138794fd56adfc8d73df15b118bffeaf1b13b64f823d873f151e628fb0561840",
+    "archive": "Orca-1.4.269-arm64-mac.zip",
+    "archive_sha256": "a6d49b13fb315c55abf68f01937e02262bfa46ce3c8d6d1833c96eebc435070d",
+    "commit": "af41be458dc02c2710502586198d6d9acf83d389",
+    "app_build_commit": "e2d67466da4a57e97dc4180d1ba33984faf59e26",
+    "source_archive_sha256": "1e06c6fdeabf16b25127f7ac78fe1fb1452eb95deb848772f1ffa3ed24866e2c",
     "team_id": "6CX3WHS9HZ",
-    "template_sha256": "cf1a66dc72f11f27320ede068fdccdb234d3ba4f0f85fb7ce3dba04b6b3b731a",
-    "web_inventory_sha256": "bbdb0e4617ef532ebe399794783c83889e61c80de4c51eb9086a6ba4ab1257c5",
+    "template_sha256": "084bc528999171df47478f3ad55a5b2d2a63fd8e0442dcfa6964fe3d748bd5e1",
+    "web_inventory_sha256": "6096ed6ddb474b9101d60f07e203dfdfb6b4f0737a74cb31fe67295582aca831",
     "artifact_source_sha256": "af5a5cf2e4bb11c8c06eb4ba8bc2f0e78260c589446c7e646a4572c6933b9772",
     "node_executable_sha256": "6f32069480ec14d52b6d7b1f3c7124cfbbc46203abf5ddf5c65b127435f3f329",
     "license_sha256": "ff1b611f80580d49f4b97e93a97b24eb050b0671b26b8afe16341fab699112f3"
@@ -25,5 +25,12 @@
   "sqlite": {
     "version": "3.54.1",
     "archive_sha3_256": "92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30"
+  },
+  "cua_driver": {
+    "version": "0.56.4",
+    "archive_sha256": "25c711d63f12d70ca08002be7ad7edeaa4c3d63e8819107722637699382d9db8",
+    "team_id": "YCK386LBJ7",
+    "license_sha256": "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9",
+    "third_party_notices_sha256": "5860ee54b73d3d84f8af8a3c3fc996739755297d91e259314416378548ee8f6d"
   }
 }

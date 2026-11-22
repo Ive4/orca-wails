@@ -115,13 +115,26 @@ def prepare(release, mac, windows):
         if node_pin != windows['source_sha256'][NODE_SOURCE]:
             raise ValueError(f'Review {NODE_SOURCE} and update the runtime pins before following {tag}')
         env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-        for name in (
+        for patch_name in (
             'macos-data-plugins.patch',
             'macos-tab-drag.patch',
             'macos-local-runtime.patch',
             'macos-plugin-catalog.patch',
+            'macos-task-timing.patch',
+            'macos-task-output-metrics.patch',
+            'macos-computer-use.patch',
+            'macos-cua-driver.patch',
+            'macos-bot-team.patch',
+            'macos-emulator-pane.patch',
+            'macos-plugin-status-bar.patch',
+            'macos-wechat-task-owner.patch',
+            'macos-local-desktop.patch',
+            'macos-chat-image-preview.patch',
+            'macos-chromium-workspace.patch',
+            'macos-shell-settings.patch',
+            'macos-local-host-regressions.patch',
         ):
-            subprocess.run(['git', 'apply', '--whitespace=error-all', ROOT / 'scripts' / name],
+            subprocess.run(['git', 'apply', '--whitespace=error-all', ROOT / 'scripts' / patch_name],
                            cwd=checkout, env={**env, 'GIT_CEILING_DIRECTORIES': directory}, check=True, timeout=30)
         print(f'{tag} macOS Core patches apply', flush=True)
         artifact_sha256 = file_digest(checkout / INVENTORY_SOURCE)

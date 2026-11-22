@@ -10,7 +10,7 @@ enum TrayIcon {
     private typealias RGB = SIMD3<Double>
     private static let turn = 2 * Double.pi
     private static let size = NSSize(width: 22, height: 22)
-    private static let radius = 9.35
+    private static let radius = 9.05
     private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private static let standard = Raster(scale: 2)
     private static let magnified = Raster(scale: 4)
@@ -36,8 +36,8 @@ enum TrayIcon {
 
     private static let lightInk = rgb(0x292e38)
     private static let darkInk = rgb(0xf5f8ff)
-    private static let lightAccents = [Accent(0x1257c5, 0x24b6ee), Accent(0xaa5d12, 0xffbe51), Accent(0xb71e4b, 0xff7298)]
-    private static let darkAccents = [Accent(0x268de9, 0xb8f5ff), Accent(0xf3a130, 0xfff0b8), Accent(0xed537d, 0xffbeca)]
+    private static let lightAccents = [Accent(0x0753bf, 0x45bdff), Accent(0x874700, 0xf5ac41), Accent(0xaa1740, 0xff829a)]
+    private static let darkAccents = [Accent(0x369dfc, 0xc4f2ff), Accent(0xf4ab3d, 0xffefb1), Accent(0xfb637f, 0xffc6d4)]
 
     @MainActor
     private struct Spectrum {
@@ -92,8 +92,9 @@ enum TrayIcon {
             let offset: Int
             let angle: Double
             let twist: Double
-            let sheen: Double
+            let innerRim: Double
             let fill: Double
+            let dashedFill: Double
             let halo: Double
         }
 
@@ -102,17 +103,24 @@ enum TrayIcon {
 
         init(scale: Int) {
             side = Int(TrayIcon.size.width) * scale
+            let density = Double(scale)
+            let dashCount = 8.0
+            let dashLength = turn * radius / dashCount
             var samples: [Sample] = []
             for row in 0..<side {
                 for column in 0..<side {
-                    let x = (Double(column) + 0.5 - Double(side) / 2) / Double(scale)
-                    let y = (Double(side) / 2 - Double(row) - 0.5) / Double(scale)
+                    let x = (Double(column) + 0.5 - Double(side) / 2) / density
+                    let y = (Double(side) / 2 - Double(row) - 0.5) / density
                     let offset = hypot(x, y) - radius
-                    let halo = clamp((1.61 - abs(offset)) * Double(scale) + 0.5)
+                    let halo = clamp((1.82 - abs(offset)) * density + 0.5)
                     guard halo > 0 else { continue }
-                    samples.append(Sample(offset: (row * side + column) * 4, angle: atan2(y, x),
-                                          twist: 0.28 * offset, sheen: 0.10 + 0.27 * clamp((offset + 0.65) / 1.35),
-                                          fill: clamp((1.09 - abs(offset)) * Double(scale) + 0.5), halo: halo))
+                    let angle = atan2(y, x)
+                    let fill = clamp((1.32 - abs(offset)) * density + 0.5)
+                    let dashPhase = abs(unit(angle * dashCount / turn + 0.5) - 0.5)
+                    let dash = clamp((0.34 - dashPhase) * dashLength * density + 0.5)
+                    samples.append(Sample(offset: (row * side + column) * 4, angle: angle,
+                                          twist: 0.28 * offset, innerRim: bell((offset + 0.65) / 0.6),
+                                          fill: fill, dashedFill: fill * dash, halo: halo))
                 }
             }
             self.samples = samples
@@ -120,28 +128,27 @@ enum TrayIcon {
 
         func image(_ frame: TrayRing.Frame, spectrum: Spectrum, ink: RGB) -> CGImage? {
             let active = frame.levels.active
-            let neutral = 0.7 * frame.levels.unconfirmed
-            let opacity = min(1, active * frame.breath + neutral)
-            guard opacity > 0 || frame.replyGlow > 0 else { return nil }
-            let tint = opacity > 0 ? active / (active + neutral) : 0
+            let opacity = active * frame.breath
+            let neutral = 0.62 * frame.levels.unconfirmed
+            guard opacity > 0 || neutral > 0 || frame.replyGlow > 0 else { return nil }
             let replyLight = (frame.replyGlow > 0 ? (ink + RGB(0.23, 0.58, 1)) * 0.5 : ink)
             var pixels = [UInt8](repeating: 0, count: side * side * 4)
             for sample in samples {
-                let fill = sample.fill * opacity
-                var color = ink
+                let activeFill = sample.fill * opacity
+                let neutralFill = sample.dashedFill * neutral * (1 - activeFill)
+                let fill = activeFill + neutralFill
+                var premultiplied = ink * neutralFill
                 var glow = 0.0
-                var light = ink
                 if let accent = spectrum.accent(at: sample.angle + sample.twist) {
                     let reflection = cos(sample.angle - frame.rotation)
-                    let sheen = sample.sheen + 0.13 * reflection * reflection
+                    let sheen = 0.06 + 0.07 * reflection * reflection
                     let pool = frame.lightAngle.map { Self.glint(at: sample.angle, head: $0) } ?? 0
-                    light = accent.light
-                    let lit = accent.base + (light - accent.base) * (sheen + (1 - sheen) * pool)
-                    color += (lit - color) * tint
-                    glow = 0.24 * pool * sample.halo * active * (1 - fill)
+                    let lit = accent.base + (accent.light - accent.base) * (sheen + (1 - sheen) * pool * sample.innerRim)
+                    glow = 0.72 * pool * sample.halo * active * (1 - fill)
+                    premultiplied += lit * activeFill + accent.light * glow
                 }
                 let reply = 0.56 * frame.replyGlow * sample.halo * (1 - fill - glow)
-                let premultiplied = color * fill + light * glow + replyLight * reply
+                premultiplied += replyLight * reply
                 pixels[sample.offset] = byte(premultiplied.x)
                 pixels[sample.offset + 1] = byte(premultiplied.y)
                 pixels[sample.offset + 2] = byte(premultiplied.z)
@@ -156,7 +163,7 @@ enum TrayIcon {
         private static func glint(at angle: Double, head: Double) -> Double {
             let behind = unit((head - angle) / turn) * turn
             let tail = exp(-behind / 0.86) * clamp(1 - behind / 1.88)
-            return clamp(0.65 * tail + 0.96 * bell(distance(angle, head) / 0.23))
+            return clamp(0.65 * tail + 0.96 * bell(distance(angle, head) / 0.38))
         }
     }
 

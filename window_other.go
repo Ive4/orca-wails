@@ -12,7 +12,7 @@ func configureOrcaWindow(options *application.WebviewWindowOptions, script strin
 	options.JS = script
 }
 
-func loadOrcaWindow(window *application.WebviewWindow, page *url.URL, _ string, show func()) error {
+func loadOrcaWindow(window *application.WebviewWindow, page *url.URL, _ string, _ legacyDesktopStorage, show func()) error {
 	window.SetURL(page.String())
 	show()
 	return nil

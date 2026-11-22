@@ -1,0 +1,1009 @@
+diff --git a/src/main/codex/structured/session-lifecycle/codex-output-metrics.test.ts b/src/main/codex/structured/session-lifecycle/codex-output-metrics.test.ts
+new file mode 100644
+index 0000000..d053497
+--- /dev/null
++++ b/src/main/codex/structured/session-lifecycle/codex-output-metrics.test.ts
+@@ -0,0 +1,236 @@
++import { describe, expect, it } from 'vitest'
++import { CodexOutputMetrics } from './codex-output-metrics'
++
++function turn(metrics: CodexOutputMetrics, method: 'started' | 'completed', id: string) {
++  metrics.observe('thread', `turn/${method}`, { turn: { id } }, 1_000)
++}
++
++function usage(metrics: CodexOutputMetrics, turnId: string, outputTokens: number) {
++  metrics.observe(
++    'thread',
++    'thread/tokenUsage/updated',
++    {
++      turnId,
++      tokenUsage: { total: { outputTokens, reasoningOutputTokens: 20 } }
++    },
++    1_000
++  )
++}
++
++function delta(metrics: CodexOutputMetrics, at: number, text: string, threadId = 'thread') {
++  metrics.observe(
++    threadId,
++    'item/agentMessage/delta',
++    {
++      turnId: 'one',
++      itemId: 'message',
++      delta: text
++    },
++    at
++  )
++}
++
++describe('Codex task output metrics', () => {
++  it('uses cumulative output as reported, clearing the measurement between turns', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    expect(metrics.read('one', 1_000)).toBeUndefined()
++    usage(metrics, 'one', 70)
++    usage(metrics, 'one', 70)
++    expect(metrics.read('one', 1_000)).toEqual({ turnOutputTokens: 70 })
++
++    turn(metrics, 'completed', 'one')
++    turn(metrics, 'started', 'one')
++    expect(metrics.read('one', 1_000)).toBeUndefined()
++    turn(metrics, 'started', 'two')
++    usage(metrics, 'one', 85)
++    expect(metrics.read('two', 1_000)).toBeUndefined()
++    usage(metrics, 'two', 110)
++    expect(metrics.read('two', 1_000)).toEqual({ turnOutputTokens: 40 })
++    expect(metrics.read('one', 1_000)).toBeUndefined()
++  })
++
++  it('waits for a complete baseline after resume or a counter reset', () => {
++    const metrics = new CodexOutputMetrics('thread', false)
++    turn(metrics, 'started', 'one')
++    usage(metrics, 'one', 900)
++    usage(metrics, 'one', 950)
++    expect(metrics.read('one', 1_000)).toBeUndefined()
++    turn(metrics, 'completed', 'one')
++
++    turn(metrics, 'started', 'two')
++    usage(metrics, 'two', 955)
++    expect(metrics.read('two', 1_000)).toEqual({ turnOutputTokens: 5 })
++    usage(metrics, 'two', 100)
++    usage(metrics, 'two', 125)
++    expect(metrics.read('two', 1_000)).toBeUndefined()
++    turn(metrics, 'completed', 'two')
++
++    turn(metrics, 'started', 'three')
++    turn(metrics, 'completed', 'three')
++    turn(metrics, 'started', 'four')
++    usage(metrics, 'four', 400)
++    expect(metrics.read('four', 1_000)).toBeUndefined()
++  })
++
++  it('invalidates the count on same-thread history rewind even when the next total is higher', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    usage(metrics, 'one', 100)
++    turn(metrics, 'completed', 'one')
++    metrics.observe('thread', 'thread/reverted', {}, 2_000)
++
++    turn(metrics, 'started', 'two')
++    usage(metrics, 'two', 130)
++    expect(metrics.read('two', 3_000)).toBeUndefined()
++  })
++
++  it('measures only fresh main-thread assistant text and ignores the first chunk', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    delta(metrics, 1_000, 'Opening chunk')
++    expect(metrics.read('one', 1_000)).toBeUndefined()
++    delta(metrics, 3_000, '好🙂好🙂')
++    delta(metrics, 3_100, 'ignored child text', 'child')
++    metrics.observe(
++      'thread',
++      'item/reasoning/summaryTextDelta',
++      {
++        turnId: 'one',
++        delta: 'ignored reasoning'
++      },
++      3_200
++    )
++    expect(metrics.read('one', 3_500)).toEqual({
++      visibleTokensPerSecond: 2,
++      visibleUntil: 7_000
++    })
++    expect(metrics.read('one', 7_000)).toBeUndefined()
++    delta(metrics, 7_100, 'new burst')
++    expect(metrics.read('one', 7_100)).toBeUndefined()
++  })
++
++  it('counts a word split across deltas only once', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    delta(metrics, 1_000, 're')
++    delta(metrics, 3_000, 'assemble 好! 好!')
++    expect(metrics.read('one', 3_000)).toEqual({
++      visibleTokensPerSecond: 2,
++      visibleUntil: 7_000
++    })
++  })
++
++  it('calibrates and publishes the last request rate before the turn ends', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    const tool = { turnId: 'one', item: { type: 'commandExecution', id: 'command' } }
++    metrics.observe('thread', 'item/started', tool, 100)
++    usage(metrics, 'one', 12)
++    metrics.observe('thread', 'item/completed', tool, 500)
++    delta(metrics, 1_000, 'word')
++    delta(metrics, 3_000, ' word'.repeat(20))
++    delta(metrics, 5_000, ' word'.repeat(20))
++    metrics.observe(
++      'thread',
++      'item/completed',
++      {
++        turnId: 'one',
++        item: { type: 'agentMessage', id: 'message', text: `word${' word'.repeat(40)}` }
++      },
++      5_050
++    )
++    const reported = { outputTokens: 102, reasoningOutputTokens: 20 }
++    const total = { outputTokens: 114 }
++    metrics.observe(
++      'thread',
++      'thread/tokenUsage/updated',
++      { turnId: 'one', tokenUsage: { total, last: reported } },
++      5_100
++    )
++    expect(metrics.read('one', 5_100)).toEqual({
++      turnOutputTokens: 114,
++      visibleTokensPerSecond: 20,
++      visibleUntil: 65_000,
++      requestRate: true
++    })
++
++    delta(metrics, 6_000, 'first')
++    usage(metrics, 'one', 114)
++    delta(metrics, 8_000, ' answer'.repeat(10))
++    expect(metrics.read('one', 8_000)).toEqual({
++      turnOutputTokens: 114,
++      visibleTokensPerSecond: 10,
++      visibleUntil: 12_000
++    })
++    expect(metrics.read('one', 65_000)).toEqual({ turnOutputTokens: 114 })
++  })
++
++  it('drops prior samples when tools start, an answer ends or the user must respond', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    usage(metrics, 'one', 73)
++    delta(metrics, 1_000, 'first')
++    delta(metrics, 3_000, ' second word')
++    expect(metrics.read('one', 3_000)?.visibleTokensPerSecond).toBe(1)
++    metrics.observe(
++      'thread',
++      'item/started',
++      {
++        turnId: 'one',
++        item: { type: 'commandExecution', id: 'command' }
++      },
++      3_100
++    )
++    expect(metrics.read('one', 3_100)).toEqual({ turnOutputTokens: 73, toolActive: true })
++    metrics.observe(
++      'thread',
++      'item/completed',
++      {
++        turnId: 'one',
++        item: { type: 'commandExecution', id: 'command' }
++      },
++      3_200
++    )
++    expect(metrics.read('one', 3_200)).toEqual({ turnOutputTokens: 73 })
++    delta(metrics, 4_000, 'third')
++    delta(metrics, 6_000, ' fourth word')
++    expect(metrics.read('one', 6_000)?.visibleTokensPerSecond).toBe(1)
++    metrics.observe(
++      'thread',
++      'item/completed',
++      {
++        turnId: 'one',
++        item: { type: 'agentMessage', id: 'message' }
++      },
++      6_100
++    )
++    expect(metrics.read('one', 6_100)).toEqual({ turnOutputTokens: 73 })
++    delta(metrics, 7_000, 'fifth')
++    delta(metrics, 9_000, ' sixth word')
++    expect(metrics.read('one', 9_000)?.visibleTokensPerSecond).toBe(1)
++    metrics.observe(
++      'thread',
++      'thread/status/changed',
++      {
++        status: { type: 'active', activeFlags: ['waitingOnUserInput'] }
++      },
++      9_100
++    )
++    expect(metrics.read('one', 9_100)).toEqual({ turnOutputTokens: 73 })
++  })
++
++  it('measures the recent window and excludes backwards timestamps', () => {
++    const metrics = new CodexOutputMetrics('thread', true)
++    turn(metrics, 'started', 'one')
++    for (let at = 1_000; at <= 8_000; at += 1_000) {
++      delta(metrics, at, at === 3_000 ? '长'.repeat(100) : ' text')
++    }
++    delta(metrics, 5_000, 'out of order')
++    expect(metrics.read('one', 8_500)).toEqual({
++      visibleTokensPerSecond: 1,
++      visibleUntil: 12_000
++    })
++    expect(metrics.read('one', 7_500)).toBeUndefined()
++  })
++})
+diff --git a/src/main/codex/structured/session-lifecycle/codex-output-metrics.ts b/src/main/codex/structured/session-lifecycle/codex-output-metrics.ts
+new file mode 100644
+index 0000000..dc10ba0
+--- /dev/null
++++ b/src/main/codex/structured/session-lifecycle/codex-output-metrics.ts
+@@ -0,0 +1,320 @@
++import type { AgentSessionOutputMetrics } from '../../../../shared/agent-session/agent-session-output-metrics'
++import { readRecord } from '../../app-server/codex-item-field-readers'
++import { readCodexThreadItem } from '../items/codex-thread-item-identity'
++import { measureCodexRequestRate, type RequestReply } from './codex-request-rate'
++import {
++  codexThreadStoppedRunning,
++  codexThreadWaitsOnUser,
++  readCodexTurnId
++} from '../../app-server/codex-structured-thread-facts'
++
++const SAMPLE_BUCKET_MS = 250
++const SAMPLE_WINDOW_MS = 5_000
++const OUTPUT_EXPIRY_MS = 4_000
++const MIN_SAMPLE_SPAN_MS = 2_000
++const REQUEST_EXPIRY_MS = 60_000
++const MIN_CALIBRATION_TOKENS = 40
++const WORD_OR_SYMBOL = /\w+|[^\s\w]/gu
++const TOOL_ITEMS = new Set([
++  'commandExecution',
++  'fileChange',
++  'mcpToolCall',
++  'dynamicToolCall',
++  'collabAgentToolCall',
++  'webSearch',
++  'imageView',
++  'imageGeneration'
++])
++
++type Sample = {
++  firstAt: number
++  lastAt: number
++  firstTokens: number
++  tokens: number
++}
++
++type ActiveTurn = {
++  id: string
++  baseline: number | undefined
++  reportedUsage: boolean
++  reply?: RequestReply | null
++  lastRate?: { tokensPerSecond: number; measuredAt: number }
++}
++
++/** One acquisition owns the counters for its primary thread. No transcript text is retained. */
++export class CodexOutputMetrics {
++  private threadTotal: number | undefined
++  private active: ActiveTurn | undefined
++  private settledTurnId: string | undefined
++  private readonly activeTools = new Set<string>()
++  private visible: { itemId: string; samples: Sample[]; endsInWord: boolean } | undefined
++  private visibleTokenScale: number | undefined
++
++  constructor(
++    private readonly threadId: string,
++    freshThread: boolean
++  ) {
++    this.threadTotal = freshThread ? 0 : undefined
++  }
++
++  observe(threadId: string, method: string, params: unknown, now: number): void {
++    if (threadId !== this.threadId) {
++      return
++    }
++    switch (method) {
++      case 'turn/started': {
++        const id = readCodexTurnId(params)
++        if (id && id !== this.active?.id && id !== this.settledTurnId) {
++          if (this.active) {
++            this.threadTotal = undefined
++          }
++          this.active = { id, baseline: this.threadTotal, reportedUsage: false }
++          this.activeTools.clear()
++          this.visible = undefined
++        }
++        return
++      }
++      case 'turn/completed': {
++        if (this.active && readCodexTurnId(params) === this.active.id) {
++          if (!this.active.reportedUsage) {
++            this.threadTotal = undefined
++          }
++          this.settledTurnId = this.active.id
++          this.active = undefined
++          this.activeTools.clear()
++          this.visible = undefined
++        }
++        return
++      }
++      case 'thread/reverted':
++        this.reset()
++        return
++      case 'model/rerouted':
++        this.visibleTokenScale = undefined
++        if (this.active) {
++          this.active.lastRate = undefined
++          this.active.reply = null
++        }
++        return
++      case 'thread/tokenUsage/updated':
++        this.observeUsage(params)
++        return
++      case 'item/agentMessage/delta':
++        this.observeVisibleDelta(params, now)
++        return
++      case 'item/started':
++      case 'item/completed': {
++        const turnId = readCodexTurnId(params)
++        if (!this.active || (turnId && turnId !== this.active.id)) {
++          return
++        }
++        const item = readCodexThreadItem(readRecord(params).item)
++        if (!item) {
++          return
++        }
++        const reply = this.active.reply
++        if (item.type === 'agentMessage' && method === 'item/completed') {
++          if (
++            reply?.itemId === item.id &&
++            turnId === this.active.id &&
++            typeof item.text === 'string'
++          ) {
++            reply.estimatedTokens = estimateTextTokens(item.text)
++          } else {
++            this.active.reply = null
++          }
++        } else if (
++          item.type !== 'agentMessage' &&
++          item.type !== 'reasoning' &&
++          item.type !== 'userMessage' &&
++          (method === 'item/started' || !this.activeTools.has(item.id))
++        ) {
++          // Tool arguments count in provider usage. Exclude requests that generated them.
++          this.active.reply = null
++        }
++
++        if (method === 'item/started') {
++          this.visible = undefined
++          if (TOOL_ITEMS.has(item.type)) {
++            this.activeTools.add(item.id)
++          }
++        } else {
++          this.activeTools.delete(item.id)
++          if (item.id === this.visible?.itemId) {
++            this.visible = undefined
++          }
++        }
++        return
++      }
++      case 'thread/status/changed':
++        if (codexThreadStoppedRunning(params) || codexThreadWaitsOnUser(params)) {
++          this.pauseVisibleOutput(threadId)
++        }
++    }
++  }
++
++  /** Rewinding can replace the cumulative count even when its next report is larger. */
++  reset(): void {
++    this.threadTotal = undefined
++    this.visibleTokenScale = undefined
++    this.active = undefined
++    this.settledTurnId = undefined
++    this.visible = undefined
++    this.activeTools.clear()
++  }
++
++  pauseVisibleOutput(threadId: string): void {
++    if (threadId === this.threadId) {
++      this.visible = undefined
++      if (this.active) {
++        this.active.reply = null
++      }
++    }
++  }
++
++  read(turnId: string, now: number): AgentSessionOutputMetrics | undefined {
++    const active = this.active
++    if (!active || turnId !== active.id) {
++      return undefined
++    }
++    const result = this.readVisible(now)
++    const lastRate = active.lastRate
++    if (
++      result.visibleTokensPerSecond === undefined &&
++      lastRate &&
++      now >= lastRate.measuredAt &&
++      now < lastRate.measuredAt + REQUEST_EXPIRY_MS
++    ) {
++      result.visibleTokensPerSecond = lastRate.tokensPerSecond
++      result.visibleUntil = lastRate.measuredAt + REQUEST_EXPIRY_MS
++      result.requestRate = true
++    }
++    if (active.baseline !== undefined && this.threadTotal !== undefined) {
++      const outputTokens = this.threadTotal - active.baseline
++      if (outputTokens > 0) {
++        result.turnOutputTokens = outputTokens
++      }
++    }
++    if (this.activeTools.size > 0) {
++      result.toolActive = true
++    }
++    return result.visibleTokensPerSecond !== undefined || result.turnOutputTokens !== undefined
++      ? result
++      : undefined
++  }
++
++  private observeUsage(params: unknown): void {
++    const turnId = readCodexTurnId(params)
++    const expectedTurn = this.active?.id ?? this.settledTurnId
++    if (!turnId || (expectedTurn && turnId !== expectedTurn)) {
++      return
++    }
++    const usage = readRecord(readRecord(params).tokenUsage)
++    const next = readRecord(usage.total).outputTokens
++    if (typeof next !== 'number' || !Number.isSafeInteger(next) || next < 0) {
++      return
++    }
++    if (this.active) {
++      if (this.threadTotal !== undefined && next < this.threadTotal) {
++        this.active.baseline = undefined
++      }
++      if (next !== this.threadTotal) {
++        const outputIncrease = this.threadTotal === undefined ? undefined : next - this.threadTotal
++        const measurement = measureCodexRequestRate(
++          this.active.reply,
++          readRecord(usage.last),
++          outputIncrease
++        )
++        if (measurement?.lastRate) {
++          this.active.lastRate = measurement.lastRate
++        }
++        if (measurement && measurement.estimatedTokens >= MIN_CALIBRATION_TOKENS) {
++          this.visibleTokenScale =
++            this.visibleTokenScale === undefined
++              ? measurement.scale
++              : (this.visibleTokenScale + measurement.scale) / 2
++        }
++        this.active.reply = undefined
++      }
++      this.active.reportedUsage = true
++    }
++    this.threadTotal = next
++  }
++
++  private observeVisibleDelta(params: unknown, at: number): void {
++    if (
++      !this.active ||
++      this.activeTools.size > 0 ||
++      readCodexTurnId(params) !== this.active.id ||
++      !Number.isSafeInteger(at)
++    ) {
++      return
++    }
++    const { delta, itemId } = readRecord(params)
++    if (typeof delta !== 'string' || !delta || typeof itemId !== 'string' || !itemId) {
++      return
++    }
++
++    const existing = this.visible?.itemId === itemId ? this.visible : undefined
++    const last = existing?.samples.at(-1)
++    if (last && at < last.lastAt) {
++      return
++    }
++    const stream =
++      existing && last && at - last.lastAt < OUTPUT_EXPIRY_MS
++        ? existing
++        : { itemId, samples: [], endsInWord: false }
++    // An ASCII word can straddle provider chunks.
++    const tokens = estimateTextTokens(delta) - (stream.endsInWord && /^\w/.test(delta) ? 1 : 0)
++    stream.endsInWord = /\w/.test(delta.at(-1) ?? '')
++    this.visible = stream
++
++    const reply = this.active.reply
++    if (reply === undefined) {
++      this.active.reply = { itemId, firstAt: at, lastAt: at, firstTokens: tokens, paused: false }
++    } else if (reply) {
++      if (reply.itemId !== itemId || reply.estimatedTokens !== undefined) {
++        this.active.reply = null
++      } else if (at >= reply.lastAt) {
++        reply.paused ||= at - reply.lastAt >= OUTPUT_EXPIRY_MS
++        reply.lastAt = at
++      }
++    }
++
++    const sample = stream.samples.at(-1)
++    if (sample && at - sample.firstAt < SAMPLE_BUCKET_MS) {
++      sample.tokens += tokens
++      sample.lastAt = at
++    } else {
++      stream.samples.push({ firstAt: at, lastAt: at, firstTokens: tokens, tokens })
++    }
++    while (stream.samples[0] && stream.samples[0].firstAt < at - SAMPLE_WINDOW_MS) {
++      stream.samples.shift()
++    }
++  }
++
++  private readVisible(now: number): AgentSessionOutputMetrics {
++    const samples = this.visible?.samples
++    const last = samples?.at(-1)
++    if (!samples || !last || now < last.lastAt || now - last.lastAt >= OUTPUT_EXPIRY_MS) {
++      return {}
++    }
++    const recent = samples.filter((sample) => sample.firstAt >= now - SAMPLE_WINDOW_MS)
++    const first = recent[0]
++    if (!first || last.lastAt - first.firstAt < MIN_SAMPLE_SPAN_MS) {
++      return {}
++    }
++    // The preceding interval for the first chunk is unknown.
++    const tokens = recent.reduce((total, sample) => total + sample.tokens, -first.firstTokens)
++    const rate = Math.round(
++      (tokens * (this.visibleTokenScale ?? 1) * 1_000) / (last.lastAt - first.firstAt)
++    )
++    return rate > 0
++      ? { visibleTokensPerSecond: rate, visibleUntil: last.lastAt + OUTPUT_EXPIRY_MS }
++      : {}
++  }
++}
++
++function estimateTextTokens(text: string): number {
++  return text.match(WORD_OR_SYMBOL)?.length ?? 0
++}
+diff --git a/src/main/codex/structured/session-lifecycle/codex-request-rate.ts b/src/main/codex/structured/session-lifecycle/codex-request-rate.ts
+new file mode 100644
+index 0000000..e5ecd76
+--- /dev/null
++++ b/src/main/codex/structured/session-lifecycle/codex-request-rate.ts
+@@ -0,0 +1,56 @@
++const MIN_REQUEST_SPAN_MS = 3_000
++
++export type RequestReply = {
++  itemId: string
++  firstAt: number
++  lastAt: number
++  firstTokens: number
++  paused: boolean
++  estimatedTokens?: number
++}
++
++/** Pair a request's reported non-reasoning output with its observed assistant text. */
++type RequestRateMeasurement = {
++  scale: number
++  estimatedTokens: number
++  lastRate?: { tokensPerSecond: number; measuredAt: number }
++}
++
++export function measureCodexRequestRate(
++  reply: RequestReply | null | undefined,
++  last: Record<string, unknown>,
++  outputIncrease: number | undefined
++): RequestRateMeasurement | undefined {
++  const { outputTokens, reasoningOutputTokens } = last
++  // The latest request must account for the entire increase since the previous report.
++  if (
++    !reply ||
++    !reply.estimatedTokens ||
++    outputIncrease === undefined ||
++    outputTokens !== outputIncrease ||
++    typeof reasoningOutputTokens !== 'number' ||
++    !Number.isSafeInteger(reasoningOutputTokens) ||
++    reasoningOutputTokens < 0 ||
++    reasoningOutputTokens >= outputTokens
++  ) {
++    return
++  }
++  const scale = (outputTokens - reasoningOutputTokens) / reply.estimatedTokens
++  if (scale < 0.25 || scale > 6) {
++    return
++  }
++  const result: RequestRateMeasurement = {
++    scale,
++    estimatedTokens: reply.estimatedTokens
++  }
++  const elapsedMs = reply.lastAt - reply.firstAt
++  if (!reply.paused && elapsedMs >= MIN_REQUEST_SPAN_MS) {
++    // The first packet arrived before we could time how long its tokens took.
++    const tokens = (reply.estimatedTokens - reply.firstTokens) * scale
++    const rate = Math.round((tokens * 1_000) / elapsedMs)
++    if (rate > 0) {
++      result.lastRate = { tokensPerSecond: rate, measuredAt: reply.lastAt }
++    }
++  }
++  return result
++}
+diff --git a/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter-lifecycle.test.ts b/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter-lifecycle.test.ts
+index a1dad43..7bbc3d8 100644
+--- a/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter-lifecycle.test.ts
++++ b/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter-lifecycle.test.ts
+@@ -15,6 +15,35 @@ import { withMissingProviderExecutable } from '../../../provider-process/provide
+ import type { CodexStructuredSessionEvent } from './codex-structured-session-state'
+ 
+ describe('CodexStructuredSessionAdapter lifecycle', () => {
++  it('reports active-turn output metrics from the real notification path', async () => {
++    const codex = fakeCodex()
++    let now = 1_700_000_000_500
++    const adapter = adapterFor(codex, {}, [], { now: () => now })
++    await acquireReadyCodexForTest(adapter, {
++      identity: identityFor('session-1'),
++      fence: 7,
++      spawnToken: 'spawn-9'
++    })
++    const notify = codex.connections[0].handlers.onNotification
++    const envelope = { threadId: THREAD_ID, turnId: 'turn-1' }
++    notify?.('turn/started', { ...envelope, turn: { id: 'turn-1' } })
++    notify?.('item/agentMessage/delta', { ...envelope, itemId: 'msg', delta: 'first' })
++    now += 2_000
++    notify?.('item/agentMessage/delta', { ...envelope, itemId: 'msg', delta: '测试🙂测试🙂' })
++    notify?.('thread/tokenUsage/updated', {
++      ...envelope,
++      tokenUsage: { total: { outputTokens: 120 } }
++    })
++    expect(adapter.readOutputMetrics('session-1', 'turn-1')).toEqual({
++      visibleTokensPerSecond: 3,
++      visibleUntil: now + 4_000,
++      turnOutputTokens: 120
++    })
++    expect(adapter.readOutputMetrics('session-1', 'another-turn')).toBeUndefined()
++    await adapter.closeSession('session-1')
++    expect(adapter.readOutputMetrics('session-1', 'turn-1')).toBeUndefined()
++  })
++
+   it('retains ownership until a child exit is proven and reports it once', async () => {
+     const codex = fakeCodex()
+     const events: CodexStructuredSessionEvent[] = []
+diff --git a/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter.ts b/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter.ts
+index 3373d92..0d1a880 100644
+--- a/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter.ts
++++ b/src/main/codex/structured/session-lifecycle/codex-structured-session-adapter.ts
+@@ -93,6 +93,14 @@ export class CodexStructuredSessionAdapter implements SessionAdapter {
+   readCommands: NonNullable<SessionAdapter['readCommands']> = (sessionId) =>
+     this.sessions.get(sessionId)?.skillReport?.read()
+ 
++  readOutputMetrics: NonNullable<SessionAdapter['readOutputMetrics']> = (sessionId, turnId) => {
++    const session = this.sessions.get(sessionId)
++    if (!session || session.ended || session.connection.closed) {
++      return undefined
++    }
++    return session.outputMetrics?.read(turnId, this.deps.now?.() ?? Date.now())
++  }
++
+   readonly atRestCommands: CodexStructuredSessionAdapterDeps['atRestCommands']
+ 
+   renameProviderSession: NonNullable<SessionAdapter['renameProviderSession']> = (input) =>
+@@ -161,6 +169,12 @@ export class CodexStructuredSessionAdapter implements SessionAdapter {
+       return admission
+     }
+     if (event.type === 'notification') {
++      session.outputMetrics?.observe(
++        event.threadId,
++        event.method,
++        event.params,
++        event.observedAt ?? this.deps.now?.() ?? Date.now()
++      )
+       turnEnd.publishCodexTurnOpened(session, event, this.sessions)
+       // Only an admitted turn end settles; a refused one settles on the retry that lands.
+       turnEnd.settleCodexSendsInEndedTurn(session, event)
+@@ -169,6 +183,8 @@ export class CodexStructuredSessionAdapter implements SessionAdapter {
+       // After the journal and the parent's republished row, never ahead of either.
+       session.backgroundTasks.publishChildWork()
+       startCodexTerminalStopProbe(this.sessions, event.sessionId, session, this.deps)
++    } else if (event.type === 'prompt') {
++      session.outputMetrics?.pauseVisibleOutput(event.threadId)
+     }
+     requestEndWait.settleCodexRequestEndWaiters(session)
+     this.deps.onEvent?.(event)
+diff --git a/src/main/codex/structured/session-lifecycle/codex-structured-session-start.ts b/src/main/codex/structured/session-lifecycle/codex-structured-session-start.ts
+index a4923fd..caaa68d 100644
+--- a/src/main/codex/structured/session-lifecycle/codex-structured-session-start.ts
++++ b/src/main/codex/structured/session-lifecycle/codex-structured-session-start.ts
+@@ -45,6 +45,7 @@ import {
+   type CodexStructuredLaunch,
+   type CodexStructuredSessionAdapterDeps
+ } from './codex-structured-session-state'
++import { CodexOutputMetrics } from './codex-output-metrics'
+ import type { CodexStructuredSessionTeardown } from './codex-structured-session-teardown'
+ 
+ type CodexOpenContext = {
+@@ -181,6 +182,10 @@ export async function openCodexStructuredSession(
+     ...codexSessionLifecycle(input.fence, generation),
+     threadId: opened.threadId,
+     historyMode: opened.historyMode,
++    outputMetrics: new CodexOutputMetrics(
++      opened.threadId,
++      returnedTurns.length === 0 && (launch.resumeThreadId === null || !!opened.supersededThreadId)
++    ),
+     permissions: {
+       acquiredMode: input.permissionMode ?? 'ask',
+       ...(opened.sandbox ? { acquiredSandbox: opened.sandbox } : {}),
+diff --git a/src/main/codex/structured/session-lifecycle/codex-structured-session-state.ts b/src/main/codex/structured/session-lifecycle/codex-structured-session-state.ts
+index 24e4044..56a7943 100644
+--- a/src/main/codex/structured/session-lifecycle/codex-structured-session-state.ts
++++ b/src/main/codex/structured/session-lifecycle/codex-structured-session-state.ts
+@@ -21,6 +21,7 @@ import type { CodexDispatchEchoes } from '../turns/codex-structured-dispatch-ech
+ import type { AgentChildWorkEvidence } from '../../../../shared/agent-status/child-work/agent-status-child-work-evidence'
+ import type { CodexBackgroundTaskTracker } from '../background-work/codex-background-task-tracker'
+ import type { CodexSkillReport } from '../catalog/codex-structured-skill-report'
++import type { CodexOutputMetrics } from './codex-output-metrics'
+ import type { CodexJournalTranslator } from '../journal/codex-structured-journal-contracts'
+ import type { StructuredAgentSessionLifecycleEvent } from '../../../native-chat/agent-session-wire/providers/structured-agent-session-adapter'
+ import type { CodexStructuredPermissionPolicy } from '../../../../shared/agent-launch/permissions/codex-permission-policy'
+@@ -58,7 +59,8 @@ export const CODEX_RECEIPT_TIMED_METHODS: ReadonlySet<string> = new Set([
+   'turn/started',
+   'turn/completed',
+   'item/started',
+-  'item/completed'
++  'item/completed',
++  'item/agentMessage/delta'
+ ])
+ 
+ export type CodexStructuredSessionEvent =
+@@ -181,6 +183,7 @@ export type CodexSession = Pick<CodexBotLaunchOptions, 'readOnly'> & {
+   catalogAccess?: CodexSessionCatalogAccess
+   dispatchEchoes: CodexDispatchEchoes
+   translator: CodexJournalTranslator | null
++  outputMetrics?: CodexOutputMetrics
+   /** Ephemeral compatibility roster; durable child records own runtime state. */
+   backgroundTasks: CodexBackgroundTaskTracker
+   skillReport?: CodexSkillReport
+diff --git a/src/main/codex/structured/threads/codex-structured-rewind.ts b/src/main/codex/structured/threads/codex-structured-rewind.ts
+index 0d8a195..afb4f02 100644
+--- a/src/main/codex/structured/threads/codex-structured-rewind.ts
++++ b/src/main/codex/structured/threads/codex-structured-rewind.ts
+@@ -198,6 +198,7 @@ export async function rewindCodexSession(
+   if (!admission.ok) {
+     return admission
+   }
++  session.outputMetrics?.reset()
+   let result: unknown
+   try {
+     result = await session.connection.request(
+diff --git a/src/main/native-chat/agent-session-wire/host/structured-agent-session-host.ts b/src/main/native-chat/agent-session-wire/host/structured-agent-session-host.ts
+index 738dc68..3efbc17 100644
+--- a/src/main/native-chat/agent-session-wire/host/structured-agent-session-host.ts
++++ b/src/main/native-chat/agent-session-wire/host/structured-agent-session-host.ts
+@@ -339,6 +339,13 @@ export class StructuredAgentSessionHost {
+ 
+   subscribeTurnCompletions = this.clientDelivery.subscribeTurnCompletions
+   readStatusSummary = this.clientDelivery.readStatusSummary
++
++  readOutputMetrics = (sessionId: string) => {
++    const work = this.clientDelivery.readPublishedWork(sessionId)
++    const turnId = work?.activeTurnId()
++    return turnId ? this.deps.adapter.readOutputMetrics?.(sessionId, turnId) : undefined
++  }
++
+   /** The usage-limit continue as the journal stands now, ahead of the next status publish. */
+   readUsageLimitContinue = async (id: string) =>
+     this.usageLimitContinue.readState(id, await this.clientDelivery.readUsageLimitCut(id))
+diff --git a/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter-router.ts b/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter-router.ts
+index b5865ac..6424593 100644
+--- a/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter-router.ts
++++ b/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter-router.ts
+@@ -190,6 +190,9 @@ export class StructuredAgentSessionAdapterRouter implements Adapter {
+   readCommands: NonNullable<Adapter['readCommands']> = (sessionId) =>
+     this.liveOwnerOrNull(sessionId)?.readCommands?.(sessionId)
+ 
++  readOutputMetrics: NonNullable<Adapter['readOutputMetrics']> = (sessionId, turnId) =>
++    this.liveOwnerOrNull(sessionId)?.readOutputMetrics?.(sessionId, turnId)
++
+   atRestCommands: StructuredAgentSessionAtRestCommands = {
+     read: (record) =>
+       this.agents.registration(record.provider)?.adapter.atRestCommands?.read(record),
+diff --git a/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter.ts b/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter.ts
+index 85b78b9..0fc63fe 100644
+--- a/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter.ts
++++ b/src/main/native-chat/agent-session-wire/providers/structured-agent-session-adapter.ts
+@@ -1,3 +1,4 @@
++import type { AgentSessionOutputMetrics } from '../../../../shared/agent-session/agent-session-output-metrics'
+ import type { StructuredMessageSteeringInputs } from '../../../../shared/agent-session/options/codex-message-compiler'
+ import type {
+   AgentSessionMcpOperation,
+@@ -297,6 +298,8 @@ export type StructuredAgentSessionAdapter = AdapterControls & {
+   retireStartup?(sessionId: string, acquisitionGeneration: string): void
+   /** Undefined preserves the client catalog when the provider reports none. */
+   readCommands?(sessionId: string): AgentSessionSlashCommand[] | undefined
++  /** Read current-turn output measurements directly from the live owner. */
++  readOutputMetrics?(sessionId: string, turnId: string): AgentSessionOutputMetrics | undefined
+   atRestCommands?: StructuredAgentSessionAtRestCommands
+   /** Claim the live callback, build reply, commit journal CAS, then answer; reject unbuildable replies before commit. */
+   answerPrompt(input: {
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts
+index 3678273..a527d94 100644
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows-verdict.test.ts
+@@ -13,6 +13,7 @@ import type {
+   AgentSessionStatusEvent,
+   AgentSessionStatusSummary
+ } from '../../../../shared/agent-session/agent-session-wire'
++import type { AgentSessionOutputMetrics } from '../../../../shared/agent-session/agent-session-output-metrics'
+ import type { RuntimeWorktreePsSummary } from '../../../../shared/worktree/catalog/runtime-worktree-contracts'
+ import { AgentHookServer, _internals } from '../../../agent-hooks/server/agent-hook-server'
+ import { createTrackedJournalOpener } from '../../../native-chat/agent-session-journal/store-lifecycle/journal-host-database-test-support'
+@@ -95,7 +96,12 @@ async function publishedSummary(journal: AgentSessionJournal): Promise<AgentSess
+ }
+ 
+ /** `children` is child-work evidence the host's records admit under the row before it re-folds. */
+-function ingest(summary: AgentSessionStatusSummary, children: AgentChildWorkEvidence[] = []) {
++function ingest(
++  summary: AgentSessionStatusSummary,
++  children: AgentChildWorkEvidence[] = [],
++  readOutputMetrics?: (sessionId: string) => AgentSessionOutputMetrics | undefined,
++  published = summary
++) {
+   const store = new AgentHookServer()
+   store.ingestStructuredStatus(summary, SUBJECT)
+   if (children.length > 0) {
+@@ -123,7 +129,8 @@ function ingest(summary: AgentSessionStatusSummary, children: AgentChildWorkEvid
+         terminalHandleByPaneKey: new Map()
+       },
+       hookSnapshots,
+-      readStructuredSummary: (id) => (id === summary.sessionId ? summary : undefined)
++      readStructuredSummary: (id) => (id === published.sessionId ? published : undefined),
++      ...(readOutputMetrics ? { readOutputMetrics } : {})
+     }),
+     orchestrationByPaneKey: null,
+     getSummary: (id) => summaries.get(id) ?? null
+@@ -269,3 +276,27 @@ describe('a request that failed reads as failed through the feed, the ingest and
+     expect(ingest(await publishedSummary(journal)).ps).toBeUndefined()
+   })
+ })
++
++it('lists output metrics only for the owned working chat in its workspace', async () => {
++  const journal = await openJournal()
++  await journal.appendItem(
++    TURN_IDENTITY,
++    { kind: 'turn', turnId: 'turn-1', state: 'running', startedAt: 1_000 },
++    { fence: 1, turnScope: AGENT_JOURNAL_THREAD_SCOPE }
++  )
++  const summary: AgentSessionStatusSummary = {
++    ...(await publishedSummary(journal)),
++    status: 'working',
++    hostExecutionOwned: true,
++    sessionId: SESSION,
++    workspaceId: WORKSPACE_ID
++  }
++  const metrics = { turnOutputTokens: 120, visibleTokensPerSecond: 6, visibleUntil: 8_000 }
++  const read = vi.fn(() => metrics)
++  expect(ingest(summary, [], read).ps?.outputMetrics).toEqual(metrics)
++  expect(read).toHaveBeenCalledExactlyOnceWith(SESSION)
++  expect(ingest({ ...summary, status: 'idle' }, [], read).ps?.outputMetrics).toBeUndefined()
++  expect(
++    ingest(summary, [], read, { ...summary, workspaceId: 'other' }).ps?.outputMetrics
++  ).toBeUndefined()
++})
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts
+index 3239bea..832208e 100644
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-rows.ts
+@@ -136,6 +136,7 @@ export function attachRuntimeWorktreeAgentRows(args: {
+         ? { completedDurationSeconds: source.completedDurationSeconds }
+         : {}),
+       updatedAt: source.updatedAt,
++      ...(source.outputMetrics ? { outputMetrics: source.outputMetrics } : {}),
+       ...(source.children !== undefined ? { children: source.children } : {}),
+       ...(source.subagents !== undefined ? { subagents: source.subagents } : {}),
+       ...(source.structuredHost === 'owned' ? { structuredHostOwned: true as const } : {}),
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts
+index 61b64d1..e7a5814 100644
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-agent-source.ts
+@@ -1,3 +1,4 @@
++import type { AgentSessionOutputMetrics } from '../../../../shared/agent-session/agent-session-output-metrics'
+ import type { StructuredHostStatus } from '../../../../shared/agent-hook-listener/listener-event'
+ import type { AgentStatusIpcPayload } from '../../../../shared/agent-status/contracts/agent-status-ipc-payload'
+ import type { ParsedAgentStatusPayload } from '../../../../shared/agent-status/contracts/agent-status-types'
+@@ -31,6 +32,7 @@ export type RuntimeWorktreeAgentSource = Pick<AgentStatusIpcPayload, 'subagents'
+   stateStartedAt: number
+   completedAt?: number
+   completedDurationSeconds?: number
++  outputMetrics?: AgentSessionOutputMetrics
+   updatedAt: number
+   /** Projected by the structured session host; `owned` rows stay fresh past the staleness window. */
+   structuredHost?: StructuredHostStatus
+diff --git a/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts b/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts
+index 978a1b0..7042c6e 100644
+--- a/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts
++++ b/src/main/runtime/workspaces/process-listing/runtime-worktree-pty-agent-sources.ts
+@@ -70,6 +70,7 @@ function completedTiming(
+ export function collectRuntimeWorktreePtyAgentSources(args: {
+   hookSnapshots: readonly AgentStatusIpcPayload[]
+   readStructuredSummary?: (sessionId: string) => AgentSessionStatusSummary | undefined
++  readOutputMetrics?: (sessionId: string) => RuntimeWorktreeAgentSource['outputMetrics']
+   mirroredWorktreeIdByTabId: ReadonlyMap<string, string>
+   connectedPtyEvidence: ConnectedPtyEvidence
+   /** A chat's /clear root: the Orca session ID its row names. Defaults to this host's records. */
+@@ -110,6 +111,14 @@ export function collectRuntimeWorktreePtyAgentSources(args: {
+       (chatSessionId
+         ? (chatOrcaSessionId ??= createChatOrcaSessionIdResolver())(chatSessionId)
+         : undefined)
++    const outputMetrics =
++      chatSessionId &&
++      structured?.status === 'working' &&
++      entry.structuredHost === 'owned' &&
++      entry.state === 'working' &&
++      entry.workingMode !== 'monitoring'
++        ? args.readOutputMetrics?.(chatSessionId)
++        : undefined
+     rowSources.set(entry.paneKey, {
+       paneKey: entry.paneKey,
+       ptyId: terminalHandle
+@@ -133,6 +142,7 @@ export function collectRuntimeWorktreePtyAgentSources(args: {
+       ...agentVerdictFields(entry),
+       stateStartedAt: entry.stateStartedAt,
+       ...completedTiming(entry, structured),
++      ...(outputMetrics ? { outputMetrics } : {}),
+       // A replay advances delivery order, not the age of the evidence shown by worktree.ps.
+       updatedAt: entry.evidenceObservedAt ?? entry.receivedAt,
+       ...(children !== undefined ? { children } : {}),
+diff --git a/src/main/runtime/workspaces/process-listing/workspace-process-listing.ts b/src/main/runtime/workspaces/process-listing/workspace-process-listing.ts
+index 8c08b22..db834c4 100644
+--- a/src/main/runtime/workspaces/process-listing/workspace-process-listing.ts
++++ b/src/main/runtime/workspaces/process-listing/workspace-process-listing.ts
+@@ -129,11 +129,13 @@ export abstract class OrcaRuntimeWithGetWorktreePs extends RuntimeChatWorkerEven
+         getTerminalHandlesForPty: (ptyId) => this.getExistingTerminalHandlesForPtyId(ptyId),
+         getSummary
+       })
++    const structuredHost = getStructuredAgentSessionHost()
+     const rowSources = collectRuntimeWorktreeAgentSources({
+       mirroredWorktreeIdByTabId,
+       connectedPtyEvidence,
+       hookSnapshots: this.paneAgentStatuses(undefined, savedAgentRecords),
+-      readStructuredSummary: getStructuredAgentSessionHost()?.readStatusSummary
++      readStructuredSummary: structuredHost?.readStatusSummary,
++      readOutputMetrics: structuredHost?.readOutputMetrics
+     })
+     attachRuntimeWorktreeAgentRows({
+       summaries,
+diff --git a/src/shared/agent-session/agent-session-output-metrics.ts b/src/shared/agent-session/agent-session-output-metrics.ts
+new file mode 100644
+index 0000000..b1dffa9
+--- /dev/null
++++ b/src/shared/agent-session/agent-session-output-metrics.ts
+@@ -0,0 +1,12 @@
++/** Ephemeral measurements for the current provider turn. */
++export type AgentSessionOutputMetrics = {
++  turnOutputTokens?: number
++  /** A provider tool item is active, so the tool name can take priority over the total. */
++  toolActive?: true
++  /** Speed of streamed assistant text, estimated until the provider reports usage. */
++  visibleTokensPerSecond?: number
++  /** True when the rate came from the last settled model request. */
++  requestRate?: true
++  /** Host wall-clock milliseconds after which the rate is stale. */
++  visibleUntil?: number
++}
+diff --git a/src/shared/worktree/catalog/runtime-worktree-contracts.ts b/src/shared/worktree/catalog/runtime-worktree-contracts.ts
+index b67488e..72bfcaf 100644
+--- a/src/shared/worktree/catalog/runtime-worktree-contracts.ts
++++ b/src/shared/worktree/catalog/runtime-worktree-contracts.ts
+@@ -1,3 +1,4 @@
++import type { AgentSessionOutputMetrics } from '../../agent-session/agent-session-output-metrics'
+ import type { DictationTerm } from '../../speech/dictation/dictation-dictionary'
+ import type { SmartTier } from '../../sidebar-list/sorting/sort-stamps'
+ import type {
+@@ -65,6 +66,8 @@ export type RuntimeWorktreeAgentRow = {
+   completedAt?: number
+   /** Whole seconds from the host's latest settled turn, when known. */
+   completedDurationSeconds?: number
++  /** Optional current-turn measurements for a live session on its execution host. */
++  outputMetrics?: AgentSessionOutputMetrics
+   updatedAt: number
+   /** Native canonical views win over the CLI roster, including an explicit empty list. */
+   children?: AgentChildWorkView[]
